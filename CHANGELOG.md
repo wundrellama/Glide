@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.4
+
+- The engine no longer aborts when a monitor appears and disappears within one compositor turn, as a Hyprland config reload can do in clamshell mode. Lan Mouse looked up every `xdg_output` event with `.expect("output")` and never destroyed the `xdg_output` object of a removed monitor; it now destroys that object with the monitor and ignores events for monitors it has already dropped.
+
 ## 0.2.3
 
 - Discovery no longer stops refreshing when Hyprland reports `solitaryBlockedBy` as null; the session check treats an absent value as "nothing blocking" instead of raising.

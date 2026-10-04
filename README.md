@@ -5,7 +5,7 @@
 <p align="center"><strong>Mouse and keyboard sharing for OMARCHY.</strong><br>Move to the edge. Keep working.</p>
 
 <p align="center">
-  <img alt="Version" src="https://img.shields.io/badge/version-0.2.3-c5ff36?style=flat-square&labelColor=111111">
+  <img alt="Version" src="https://img.shields.io/badge/version-0.2.4-c5ff36?style=flat-square&labelColor=111111">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Omarchy%20%2F%20Hyprland-c5ff36?style=flat-square&labelColor=111111">
   <img alt="Network" src="https://img.shields.io/badge/network-LAN%20only-c5ff36?style=flat-square&labelColor=111111">
 </p>
