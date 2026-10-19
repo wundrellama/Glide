@@ -3,6 +3,7 @@ import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 Panel {
@@ -151,7 +152,7 @@ Panel {
 
   component Label: Text {
     textFormat: Text.PlainText
-    color: Color.foreground
+    color: Commons.Color.foreground
     font.family: Style.font.family
     font.pixelSize: Style.font.body
     wrapMode: Text.WordWrap
@@ -181,8 +182,8 @@ Panel {
         Layout.fillWidth: true
         implicitHeight: Style.space(80)
         radius: Style.space(10)
-        color: Qt.alpha(Color.accent, 0.075)
-        border.color: Qt.alpha(Color.accent, 0.22)
+        color: Qt.alpha(Commons.Color.accent, 0.075)
+        border.color: Qt.alpha(Commons.Color.accent, 0.22)
         RowLayout {
           anchors.fill: parent
           anchors.margins: Style.space(14)
@@ -198,25 +199,25 @@ Panel {
                 y: Style.space(index === 1 ? 0 : 12)
                 width: Style.space(35); height: Style.space(26)
                 radius: Style.space(4)
-                color: Color.background
-                border.color: Color.accent
+                color: Commons.Color.background
+                border.color: Commons.Color.accent
                 border.width: index===1 ? 2 : 1
-                Rectangle { anchors.fill: parent; anchors.margins: 4; radius: 2; color: Qt.alpha(Color.accent,0.15+parent.index*0.06) }
-                Rectangle { anchors.top: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter; width: Style.space(2); height: Style.space(5); color: Color.accent }
-                Rectangle { anchors.top: parent.bottom; anchors.topMargin: Style.space(5); anchors.horizontalCenter: parent.horizontalCenter; width: Style.space(16); height: Style.space(2); color: Color.accent }
+                Rectangle { anchors.fill: parent; anchors.margins: 4; radius: 2; color: Qt.alpha(Commons.Color.accent,0.15+parent.index*0.06) }
+                Rectangle { anchors.top: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter; width: Style.space(2); height: Style.space(5); color: Commons.Color.accent }
+                Rectangle { anchors.top: parent.bottom; anchors.topMargin: Style.space(5); anchors.horizontalCenter: parent.horizontalCenter; width: Style.space(16); height: Style.space(2); color: Commons.Color.accent }
               }
             }
           }
           Column {
             spacing: Style.space(3)
             Label { text: "GLIDE"; font.pixelSize: Style.space(27); font.bold: true; font.letterSpacing: Style.space(5) }
-            Label { text: "ONE DESK. EVERY MACHINE."; color: Color.accent; font.pixelSize: Style.font.caption; font.letterSpacing: Style.space(1) }
+            Label { text: "ONE DESK. EVERY MACHINE."; color: Commons.Color.accent; font.pixelSize: Style.font.caption; font.letterSpacing: Style.space(1) }
           }
           Item { Layout.fillWidth: true }
           Column {
             spacing: Style.space(5)
-            Label { text: root.statusText.toUpperCase(); color: root.state.ready ? Color.accent : Color.foreground; font.bold: true; horizontalAlignment: Text.AlignRight; anchors.right: parent.right }
-            Label { text: "LAN ONLY  /  ENCRYPTED"; color: Qt.alpha(Color.foreground,0.55); font.pixelSize: Style.font.caption }
+            Label { text: root.statusText.toUpperCase(); color: root.state.ready ? Commons.Color.accent : Commons.Color.foreground; font.bold: true; horizontalAlignment: Text.AlignRight; anchors.right: parent.right }
+            Label { text: "LAN ONLY  /  ENCRYPTED"; color: Qt.alpha(Commons.Color.foreground,0.55); font.pixelSize: Style.font.caption }
           }
           Action { text: root.state.running ? "Pause" : "Resume"; enabled: !root.busy; onClicked: root.act("toggle") }
         }
@@ -231,8 +232,8 @@ Panel {
         Rectangle {
           anchors.fill: parent
           radius: Style.space(9)
-          color: Qt.alpha(Color.background, 0.65)
-          border.color: Qt.alpha(Color.accent, 0.2)
+          color: Qt.alpha(Commons.Color.background, 0.65)
+          border.color: Qt.alpha(Commons.Color.accent, 0.2)
         }
         Canvas {
           id: circuitry
@@ -243,7 +244,7 @@ Panel {
           onPaint: {
             var ctx = getContext("2d")
             ctx.reset()
-            var accent = Color.accent
+            var accent = Commons.Color.accent
             ctx.fillStyle = Qt.alpha(accent, 0.18)
             for (var gx=12; gx<width; gx+=24) for (var gy=12; gy<height; gy+=24) ctx.fillRect(gx,gy,1,1)
             for (var a=0; a<root.draft.length; a++) {
@@ -283,8 +284,8 @@ Panel {
             width: board.cellWidth-6; height: board.cellHeight-6
             radius: Style.space(6)
             color: "transparent"
-            border.color: Qt.alpha(Color.foreground, 0.06)
-            Label { anchors.centerIn: parent; text: "·"; color: Qt.alpha(Color.accent,0.2) }
+            border.color: Qt.alpha(Commons.Color.foreground, 0.06)
+            Label { anchors.centerIn: parent; text: "·"; color: Qt.alpha(Commons.Color.accent,0.2) }
           }
         }
         Repeater {
@@ -300,25 +301,25 @@ Panel {
             z: dragArea.drag.active ? 10 : 1
             radius: Style.space(6)
             gradient: Gradient {
-              GradientStop { position: 0; color: Qt.tint(Color.background, Qt.alpha(Color.accent, root.selected===machineCard.modelData.id ? 0.25 : 0.12)) }
-              GradientStop { position: 1; color: Color.background }
+              GradientStop { position: 0; color: Qt.tint(Commons.Color.background, Qt.alpha(Commons.Color.accent, root.selected===machineCard.modelData.id ? 0.25 : 0.12)) }
+              GradientStop { position: 1; color: Commons.Color.background }
             }
-            border.color: root.selected===modelData.id ? Color.accent : Qt.alpha(Color.accent,0.45)
+            border.color: root.selected===modelData.id ? Commons.Color.accent : Qt.alpha(Commons.Color.accent,0.45)
             border.width: root.selected===modelData.id ? 2 : 1
             Rectangle {
               anchors.fill: parent; anchors.margins: -4; z: -1
               radius: Style.space(8); color: "transparent"
-              border.width: 3; border.color: Qt.alpha(Color.accent, root.selected===machineCard.modelData.id ? 0.16 : 0.04)
+              border.width: 3; border.color: Qt.alpha(Commons.Color.accent, root.selected===machineCard.modelData.id ? 0.16 : 0.04)
             }
-            Rectangle { anchors.top: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter; width: Style.space(3); height: Style.space(5); color: Qt.alpha(Color.accent,0.7) }
-            Rectangle { anchors.top: parent.bottom; anchors.topMargin: Style.space(5); anchors.horizontalCenter: parent.horizontalCenter; width: Style.space(30); height: Style.space(2); radius: 1; color: Qt.alpha(Color.accent,0.65) }
-            Rectangle { x: Style.space(7); y: Style.space(7); width: Style.space(4); height: width; radius: width/2; color: root.state.running ? Color.accent : Qt.alpha(Color.foreground,0.35) }
+            Rectangle { anchors.top: parent.bottom; anchors.horizontalCenter: parent.horizontalCenter; width: Style.space(3); height: Style.space(5); color: Qt.alpha(Commons.Color.accent,0.7) }
+            Rectangle { anchors.top: parent.bottom; anchors.topMargin: Style.space(5); anchors.horizontalCenter: parent.horizontalCenter; width: Style.space(30); height: Style.space(2); radius: 1; color: Qt.alpha(Commons.Color.accent,0.65) }
+            Rectangle { x: Style.space(7); y: Style.space(7); width: Style.space(4); height: width; radius: width/2; color: root.state.running ? Commons.Color.accent : Qt.alpha(Commons.Color.foreground,0.35) }
             Column {
               anchors.centerIn: parent
               width: parent.width-Style.space(10)
               spacing: Style.space(3)
               Label { width: parent.width; horizontalAlignment: Text.AlignHCenter; text: machineCard.modelData.name; font.bold: true }
-              Label { width: parent.width; horizontalAlignment: Text.AlignHCenter; text: machineCard.modelData.id===root.inventory.self.id ? "This machine" : machineCard.modelData.ip; font.pixelSize: Style.font.caption; color: Qt.alpha(Color.foreground,0.7) }
+              Label { width: parent.width; horizontalAlignment: Text.AlignHCenter; text: machineCard.modelData.id===root.inventory.self.id ? "This machine" : machineCard.modelData.ip; font.pixelSize: Style.font.caption; color: Qt.alpha(Commons.Color.foreground,0.7) }
             }
             MouseArea {
               id: dragArea
@@ -348,7 +349,7 @@ Panel {
       RowLayout {
         Layout.fillWidth: true
         Label { text: "Nearby Omarchy machines"; font.bold: true }
-        Label { text: "LAN only · active sessions"; color: Qt.alpha(Color.foreground,0.6) }
+        Label { text: "LAN only · active sessions"; color: Qt.alpha(Commons.Color.foreground,0.6) }
         Item { Layout.fillWidth: true }
         Action { text: scanProcess.running ? "Scanning…" : "Scan LAN"; enabled: !scanProcess.running && !root.busy; onClicked: root.scan() }
       }
@@ -369,17 +370,17 @@ Panel {
       }
       RowLayout {
         Layout.fillWidth: true
-        Label { Layout.fillWidth: true; text: "Pairing uses your SSH login and installs Glide on the remote Omarchy desktop.\nPhysical input returns home and centers the pointer. Emergency return: left Ctrl + left Shift + Esc."; color: Qt.alpha(Color.foreground,0.7); font.pixelSize: Style.font.caption }
+        Label { Layout.fillWidth: true; text: "Pairing uses your SSH login and installs Glide on the remote Omarchy desktop.\nPhysical input returns home and centers the pointer. Emergency return: left Ctrl + left Shift + Esc."; color: Qt.alpha(Commons.Color.foreground,0.7); font.pixelSize: Style.font.caption }
         Action { text: "Add selected"; enabled: !!root.selectedMachine && !root.selectedInLayout && root.draft.length<9 && !root.busy; onClicked: root.addSelected() }
       }
       Label {
         visible: root.message!==""; Layout.fillWidth: true
-        text: root.message; color: root.failed ? Color.urgent : Color.accent
+        text: root.message; color: root.failed ? Commons.Color.urgent : Commons.Color.accent
         font.pixelSize: Style.font.caption
       }
       RowLayout {
         Layout.fillWidth: true
-        Label { text: "◉  PHYSICAL INPUT PRIORITY    ·    "+root.draft.length+" / 9 MACHINES"; font.pixelSize: Style.font.caption; color: Qt.alpha(Color.foreground,0.6) }
+        Label { text: "◉  PHYSICAL INPUT PRIORITY    ·    "+root.draft.length+" / 9 MACHINES"; font.pixelSize: Style.font.caption; color: Qt.alpha(Commons.Color.foreground,0.6) }
         Item { Layout.fillWidth: true }
         Action { text: "Reset draft"; enabled: root.dirty && !root.busy; onClicked: root.reloadDraft() }
         Action { text: apply.running ? "Applying…" : "Apply layout"; enabled: root.dirty && !root.busy; onClicked: root.saveLayout() }
