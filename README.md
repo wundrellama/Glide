@@ -96,6 +96,39 @@ python3 scripts/glide-control.py status
 
 Uninstall disables the plugin and services and removes recorded Glide firewall rules. It retains pairing identities, source, device-access rules, and recovery files.
 
+## Text-on-crossing prototype (opt-in, unverified live)
+
+An experimental, **disabled-by-default** prototype: when your pointer crosses onto a configured peer, the machine you are leaving pushes its current UTF-8 text selection to that peer over the existing authorized SSH channel, and the peer installs it with `wl-copy`. This has **not been verified on a live deployment**; treat it as a development prototype, not a supported feature.
+
+**Direction and limits:**
+
+- Each hook pushes in one direction: the machine you cross *away from* sends; the machine you cross *onto* receives. Both ends opt in towards each other, so reapplying the layout on both installs outbound hooks on both. This is not continuous sync, and returning a remotely controlled pointer or reclaiming local control does not guarantee a reverse clipboard transfer.
+- Text only: `text/plain;charset=utf-8` (or `text/plain`), at most 1 MiB, exact bytes preserved. Images, files, and anything flagged secret (`CLIPBOARD_STATE=sensitive`, password-manager MIME hints) are skipped silently.
+- Both ends must opt in and name each other, both sessions must be active and unlocked, and the Glide service must be running on both. Anything else fails closed and shares nothing.
+
+**Prerequisites (no new keys are provisioned):** persistent SSH public-key auth from sender to receiver must already work non-interactively — the prototype uses the existing strict host-identity, `BatchMode` SSH setup and never prompts. Password-based or agent-cached connections expire and will then silently skip transfers. `wl-paste`/`wl-copy` (wl-clipboard) must be installed on both machines.
+
+**Enable (host pushes to client):**
+
+```bash
+# On the machine you cross AWAY FROM (sender), with the receiver's 32-hex device identity:
+python3 ~/.config/omarchy/plugins/nixfred.glide/scripts/glide_clipboard.py enable <receiver-id>
+# On the machine you cross ONTO (receiver), with the sender's identity:
+python3 ~/.config/omarchy/plugins/nixfred.glide/scripts/glide_clipboard.py enable <sender-id>
+```
+
+`enable` only writes `~/.config/omarchy-glide/clipboard.json`; it never touches the live sharing configuration. The hook appears only the next time you **Apply layout** in the Glide panel, and takes effect after the Glide service restarts (`systemctl --user restart omarchy-glide.service` if already running). Check state with `glide_clipboard.py status`.
+
+**Rollback:**
+
+```bash
+# On both machines:
+python3 ~/.config/omarchy/plugins/nixfred.glide/scripts/glide_clipboard.py disable
+# Then Apply layout again (or restart omarchy-glide.service after removing the hook) to drop the enter hook.
+```
+
+**Risks:** secret detection is best-effort: `CLIPBOARD_STATE` is normally provided to clipboard watchers, not this entry hook, and not every password manager offers a recognizable MIME hint. Unmarked passwords can therefore be transferred. Whatever plain text sits in the sender's clipboard at the moment of a crossing is sent to the peer's clipboard — including text you forgot was there, and over a crossing you made by accident. The SSH channel is authenticated and encrypted, but the text lands in the receiver's clipboard unprotected and may persist in its clipboard history. The prototype never logs clipboard contents.
+
 ## Credits and licensing
 
 Built by **Fred Nix** for Omarchy, powered by **[Lan Mouse](https://github.com/feschber/lan-mouse)** by Ferdinand Schober and contributors. Vendored baseline: `0d2190e787db9e482e17d4c16fb7c00ef4841bcb` (Lan Mouse 0.11.0 source).

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import subprocess
 import tarfile
@@ -165,6 +166,19 @@ def neighbors(node, nodes):
     return result
 
 
+def clipboard_hook(peer_id):
+    """Enter-hook command for the opt-in text-on-crossing prototype.
+
+    Only an explicitly enabled, well-formed, configured peer gets a hook;
+    anything else renders no hook at all (fail closed, disabled by default).
+    """
+    settings = read_json(CONFIG/'clipboard.json', {})
+    if not isinstance(settings, dict) or not settings.get('enabled'): return None
+    if not re.fullmatch(r'[0-9a-f]{32}', str(settings.get('peer_id', ''))): return None
+    if settings['peer_id'] != peer_id: return None
+    return 'python3 '+shlex.quote(str(PLUGIN/'scripts'/'glide_clipboard.py'))+' send '+peer_id
+
+
 def render_config(layout, me):
     nodes = validate_layout(layout)
     local = next((n for n in nodes if n['id'] == me['id']), None)
@@ -185,6 +199,9 @@ def render_config(layout, me):
     for side, peer in peers.items():
         # No hostname in the engine config: DNS must not introduce a VPN/public address.
         lines.extend(['', '[[clients]]', 'position = '+json.dumps(side), 'ips = '+json.dumps([peer['ip']]), 'port = 4242', 'activate_on_startup = true'])
+        # Opt-in prototype: push clipboard text to this peer when the pointer crosses.
+        hook = clipboard_hook(peer['id'])
+        if hook: lines.append('enter_hook = '+json.dumps(hook))
     content = '\n'.join(lines)+'\n'
     tomllib.loads(content)
     return content
