@@ -7,6 +7,7 @@ Wants=omarchy-glide-idle.service
 
 [Service]
 Type=simple
+ExecStartPre=/usr/bin/python3 %h/.config/omarchy/plugins/wundrellama.glide/scripts/glide_clipboard.py reconcile
 ExecStart=/usr/bin/systemd-inhibit --what=idle:sleep --mode=block --who=Glide '--why=Remote mouse control' %h/.local/bin/omarchy-glide-engine daemon
 Restart=on-failure
 RestartSec=3

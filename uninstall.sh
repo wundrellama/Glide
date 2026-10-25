@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 base=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-omarchy plugin disable nixfred.glide
+omarchy plugin disable wundrellama.glide
 systemctl --user disable --now omarchy-glide.service omarchy-glide-discovery.service omarchy-glide-idle.service
 python3 - <<'PY'
 import json, subprocess

@@ -2,7 +2,7 @@
 set -euo pipefail
 base=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 : "${OMARCHY_PATH:?Run the installer from your Omarchy desktop terminal}"
-omarchy pkg add lan-mouse python-evdev python-dbus python-gobject avahi
+omarchy pkg add lan-mouse python-evdev python-dbus python-gobject avahi wl-clipboard
 if ! command -v cargo >/dev/null; then omarchy pkg add rust; fi
 "$base/build-engine.sh"
 python3 "$base/scripts/setup.py"
@@ -35,8 +35,8 @@ rm -f "$HOME/.config/systemd/user/omarchy-glide-owner.service"
 systemctl --user enable --now omarchy-glide.service omarchy-glide-discovery.service omarchy-glide-idle.service
 # Let Omarchy finish its asynchronous plugin inventory refresh.
 for attempt in {1..12}; do
-  if omarchy plugin list --json | jq -e '.[] | select(.id=="nixfred.glide")' >/dev/null; then break; fi
+  if omarchy plugin list --json | jq -e '.[] | select(.id=="wundrellama.glide")' >/dev/null; then break; fi
   sleep 0.25
 done
-omarchy bar put nixfred.glide --section right
+omarchy bar put wundrellama.glide --section right
 printf '%s\n' 'Glide installed. Open the mouse icon, select a nearby machine, authorize SSH, position it, and apply.'

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-target="$HOME/.config/omarchy/plugins/nixfred.glide"
+target="$HOME/.config/omarchy/plugins/wundrellama.glide"
 if [[ -L "$target" ]]; then
   unlink "$target"
 fi
@@ -14,4 +14,5 @@ cp "$source_dir/remote-install.sh" "$target/remote-install.sh"
 cp "$source_dir/manifest.json" "$target/manifest.json"
 cp "$source_dir/assets/glide-icon.png" "$target/assets/glide-icon.png"
 omarchy plugin validate "$target"
+python3 "$target/scripts/retire-plugin.py"
 omarchy-shell shell rescanPlugins

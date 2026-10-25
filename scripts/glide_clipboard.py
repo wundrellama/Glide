@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
 import subprocess
 from subprocess import TimeoutExpired
 import sys
@@ -22,8 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import glide_network as g
 
 MAX = 1024 * 1024  # 1 MiB hard bound on clipboard text
-REMOTE = 'python3 .config/omarchy/plugins/nixfred.glide/scripts/glide_clipboard.py'
+REMOTE = 'python3 .config/omarchy/plugins/wundrellama.glide/scripts/glide_clipboard.py'
 ENV_WHITELIST = ('WAYLAND_DISPLAY', 'HYPRLAND_INSTANCE_SIGNATURE')
+PAIR_ACTIONS = ('probe', 'snapshot', 'apply', 'restore')
+PAIR_PAYLOAD_MAX = 1024 * 1024
 
 
 class Failure(Exception):
@@ -241,8 +244,421 @@ def status():
             f'{hook}. Direction: this machine sends its clipboard text to that peer on crossing.')
 
 
+def layout_key(layout):
+    """JSON-stable comparison key for a saved layout (positions + identities)."""
+    if not isinstance(layout, dict):
+        return None
+    try:
+        nodes = g.validate_layout(layout)
+    except (ValueError, KeyError):
+        return None
+    return sorted([[n['id'], n['x'], n['y'], n['ip'], n['fingerprint']] for n in nodes])
+
+
+def actual_hook(peer):
+    """The enter_hook the live engine config has for this peer, or None."""
+    try:
+        config = g.tomllib.loads(g.LAN_CONFIG.read_text())
+    except (OSError, ValueError):
+        return None
+    for client in config.get('clients', []):
+        if client.get('ips') == [peer['ip']]:
+            return client.get('enter_hook')
+    return None
+
+
+def pair_status_local(peer_id):
+    """Read-only local half of pair-status. Never uses SSH, never writes state."""
+    out = {'peer_id': peer_id, 'valid': valid_id(peer_id), 'enabled': False,
+           'adjacent': False, 'peer': None, 'me_id': None, 'layout_key': None,
+           'hook_expected': None, 'hook_actual': None, 'hook_ok': False,
+           'helper': (g.PLUGIN / 'scripts' / 'glide_clipboard.py').exists(),
+           'deps': bool(shutil.which('wl-copy') and shutil.which('wl-paste'))}
+    if not out['valid']:
+        return out
+    out['me_id'] = g.identity()['id']
+    out['layout_key'] = layout_key(g.read_json(g.CONFIG / 'layout.json', None))
+    out['enabled'] = enabled_peer() == peer_id
+    peer = adjacent_peer(peer_id)
+    if peer:
+        out['adjacent'] = True
+        out['peer'] = {'id': peer['id'], 'name': peer['name'], 'ip': peer['ip']}
+        expected = g.clipboard_hook(peer_id) if out['enabled'] else None
+        actual = actual_hook(peer)
+        out.update(hook_expected=expected, hook_actual=actual,
+                   hook_ok=(expected is not None and expected == actual)
+                   if out['enabled'] else actual is None)
+    return out
+
+
+def local_pair_view():
+    """This machine's own configured opt-in state, served to the remote probe."""
+    peer_id = enabled_peer()
+    view = {'enabled': peer_id is not None, 'peer_id': peer_id,
+            'helper': (g.PLUGIN / 'scripts' / 'glide_clipboard.py').exists(),
+            'deps': bool(shutil.which('wl-copy') and shutil.which('wl-paste')),
+            'hook_expected': None, 'hook_actual': None, 'hook_ok': True}
+    if peer_id:
+        peer = adjacent_peer(peer_id)
+        expected = g.clipboard_hook(peer_id)
+        actual = actual_hook(peer) if peer else None
+        view.update(hook_expected=expected, hook_actual=actual,
+                    hook_ok=bool(expected) and expected == actual)
+    return view
+
+
+def remote_probe():
+    me = g.identity()
+    view = local_pair_view()
+    view['identity'] = {'id': me['id'], 'fingerprint': me['fingerprint'], 'name': me['name']}
+    view['layout'] = layout_key(g.read_json(g.CONFIG / 'layout.json', None))
+    return view
+
+
+def pair_remote(peer, action, payload=None, timeout=5):
+    """Bounded, allowlisted clipboard-pairing operation on a paired peer."""
+    if action not in PAIR_ACTIONS:
+        raise Failure('invalid remote action')
+    response = g.run(g.ssh_args(peer) + [REMOTE + ' _remote ' + action],
+                     input=json.dumps(payload) if payload is not None else '',
+                     timeout=timeout)
+    if response.returncode:
+        raise Failure('SSH authorization required or peer unavailable. '
+                      + (getattr(response, 'stderr', '') or '').strip()[-300:])
+    try:
+        data = json.loads(response.stdout)
+    except ValueError:
+        raise Failure('peer is running an incompatible Glide helper')
+    if not data.get('ok'):
+        raise Failure(str(data.get('error', 'request failed')))
+    return data['result']
+
+
+def pair_snapshot():
+    """Raw bytes of both managed files plus the service's active state."""
+    clip_path, lan = g.CONFIG / 'clipboard.json', g.LAN_CONFIG
+    return {'clipboard': clip_path.read_text() if clip_path.exists() else None,
+            'config': lan.read_text() if lan.exists() else None,
+            'active': g.run(['systemctl', '--user', 'is-active', '--quiet',
+                             g.SERVICE]).returncode == 0}
+
+
+def pair_restore(snap):
+    """Roll back managed bytes; try-restart reloads only an active service."""
+    if not isinstance(snap, dict) or not isinstance(snap.get('active'), bool):
+        raise Failure('invalid recovery snapshot')
+    clip_data = snap.get('clipboard')
+    if clip_data is None:
+        (g.CONFIG / 'clipboard.json').unlink(missing_ok=True)
+    else:
+        try:
+            json.loads(clip_data)  # never restore corrupt preferences
+        except (TypeError, ValueError):
+            raise Failure('invalid recovery snapshot')
+        g.atomic(g.CONFIG / 'clipboard.json', clip_data)
+    config = snap.get('config')
+    if config is None:
+        g.LAN_CONFIG.unlink(missing_ok=True)
+    else:
+        try:
+            g.tomllib.loads(config)  # never restore a corrupt engine config
+        except (TypeError, ValueError):
+            raise Failure('invalid recovery snapshot')
+        g.atomic(g.LAN_CONFIG, config)
+    # try-restart restarts an active service with the recovered bytes and
+    # leaves a paused service untouched: a rollback must never wake it.
+    g.run(['systemctl', '--user', 'try-restart', g.SERVICE])
+
+
+def pair_apply_settings(peer_id, enable):
+    """Write prefs, regenerate the engine config, restart only if active.
+
+    Used by the local pair flow and by the peer's own '_remote apply'. Any
+    failure restores the prior bytes and never wakes a paused service.
+    """
+    me = g.identity()
+    layout = g.read_json(g.CONFIG / 'layout.json', None)
+    if not isinstance(layout, dict):
+        raise Failure('no saved Glide layout')
+    nodes = g.validate_layout(layout)
+    local = next((n for n in nodes if n['id'] == me['id']), None)
+    if not local:
+        raise Failure('this machine is not in the saved layout')
+    if not any(p['id'] == peer_id for p in g.neighbors(local, nodes).values()):
+        raise Failure('peer is not adjacent in the saved layout')
+    current = settings()
+    if not enable and current.get('enabled') and current.get('peer_id') != peer_id:
+        raise Failure('this machine is paired with a different peer; refusing')
+    snap = pair_snapshot()
+    try:
+        prefs = {'enabled': True, 'peer_id': peer_id} if enable else {'enabled': False}
+        g.atomic(g.CONFIG / 'clipboard.json', json.dumps(prefs, indent=2))
+        content = g.render_config(layout, me)  # reads the prefs just written
+        g.atomic(g.LAN_CONFIG, content)
+    except Exception:
+        pair_restore(snap)
+        raise
+    if snap['active']:
+        check = g.run(['systemctl', '--user', 'restart', g.SERVICE])
+        if check.returncode:
+            pair_restore(snap)
+            raise Failure('could not restart the Glide sharing service')
+    return True
+
+
+def pair_precheck(peer_id):
+    """Saved identity + adjacency + direct-LAN validation shared by pair ops."""
+    if not valid_id(peer_id):
+        raise Failure('invalid device identity')
+    me = g.identity()
+    layout = g.read_json(g.CONFIG / 'layout.json', None)
+    if not isinstance(layout, dict):
+        raise Failure('no saved Glide layout')
+    nodes = g.validate_layout(layout)
+    local = next((n for n in nodes if n['id'] == me['id']), None)
+    if not local:
+        raise Failure('this machine is not in the saved layout')
+    peer = next((p for p in g.neighbors(local, nodes).values() if p['id'] == peer_id), None)
+    if not peer:
+        raise Failure('peer is not adjacent in the saved layout')
+    if not g.on_lan(peer['ip']):
+        raise Failure('peer is not on a directly attached LAN')
+    return me, layout, peer
+
+
+def check_probe(probe, peer, key):
+    ident = probe.get('identity') or {}
+    if ident.get('id') != peer['id'] or ident.get('fingerprint') != peer['fingerprint']:
+        raise Failure(f"{peer['name']}: device identity changed; reauthorize it")
+    if probe.get('layout') != key:
+        raise Failure(f"{peer['name']}: has a different saved Glide layout; "
+                      're-apply the layout on both machines first')
+    if not probe.get('helper'):
+        raise Failure(f"{peer['name']}: the clipboard helper is not installed")
+    if not probe.get('deps'):
+        raise Failure(f"{peer['name']}: wl-clipboard (wl-copy/wl-paste) is not installed")
+
+
+def pair_enable(peer_id):
+    """Opt both machines into text-on-crossing towards each other, atomically."""
+    me, layout, peer = pair_precheck(peer_id)
+    probe = pair_remote(peer, 'probe')
+    check_probe(probe, peer, layout_key(layout))
+    remote_snap = pair_remote(peer, 'snapshot')
+    local_snap = pair_snapshot()
+    try:
+        pair_remote(peer, 'apply', {'enabled': True, 'peer_id': me['id']}, timeout=10)
+    except Exception as exc:
+        note = ''
+        try:
+            pair_remote(peer, 'restore', remote_snap, timeout=10)
+        except Exception as recovery:
+            note = '; recovery requires attention: ' + str(recovery)
+        raise Failure(f"{peer['name']}: {exc}{note}")
+    try:
+        pair_apply_settings(peer_id, True)
+    except Exception as exc:
+        failures = []
+        try:
+            pair_remote(peer, 'restore', remote_snap, timeout=10)
+        except Exception as recovery:
+            failures.append(str(recovery))
+        try:
+            pair_restore(local_snap)
+        except Exception as recovery:
+            failures.append(str(recovery))
+        raise Failure(str(exc) + ('; recovery requires attention: ' + '; '.join(failures)
+                                  if failures else '; prior state restored on both machines'))
+    return pair_status(peer_id)
+
+
+def pair_disable(peer_id):
+    """Opt both machines out; refuses to disturb a different configured peer."""
+    me, layout, peer = pair_precheck(peer_id)
+    current = settings()
+    if current.get('enabled') and current.get('peer_id') != peer_id:
+        raise Failure('this machine is paired with a different peer; refusing')
+    probe = pair_remote(peer, 'probe')
+    check_probe(probe, peer, layout_key(layout))
+    remote_snap = pair_remote(peer, 'snapshot')
+    local_snap = pair_snapshot()
+    try:
+        pair_remote(peer, 'apply', {'enabled': False, 'peer_id': me['id']}, timeout=10)
+    except Exception as exc:
+        note = ''
+        try:
+            pair_remote(peer, 'restore', remote_snap, timeout=10)
+        except Exception as recovery:
+            note = '; recovery requires attention: ' + str(recovery)
+        raise Failure(f"{peer['name']}: {exc}{note}")
+    try:
+        pair_apply_settings(peer_id, False)
+    except Exception as exc:
+        failures = []
+        try:
+            pair_remote(peer, 'restore', remote_snap, timeout=10)
+        except Exception as recovery:
+            failures.append(str(recovery))
+        try:
+            pair_restore(local_snap)
+        except Exception as recovery:
+            failures.append(str(recovery))
+        raise Failure(str(exc) + ('; recovery requires attention: ' + '; '.join(failures)
+                                  if failures else '; prior state restored on both machines'))
+    return pair_status(peer_id)
+
+
+def pair_status(peer_id):
+    """Read-only pair state for one peer. Probes the peer with a <=5s budget."""
+    local = pair_status_local(peer_id)
+    result = {'peer_id': peer_id, 'enabled': False, 'ready': False, 'state': 'off',
+              'message': 'text-on-crossing is not enabled for this peer',
+              'local': local, 'remote': None}
+    if not local['valid']:
+        result['message'] = 'not a valid device identity'
+        return result
+    if not local['adjacent']:
+        if local['enabled']:
+            result.update(state='needs-attention',
+                          message='the configured peer is not adjacent in the saved '
+                                  'layout; re-apply the layout or disable the pairing')
+        else:
+            result['message'] = 'peer is not adjacent in the saved Glide layout'
+        return result
+    peer = adjacent_peer(peer_id)
+    if not peer:
+        return result  # unreachable: local['adjacent'] was verified above
+    try:
+        remote = pair_remote(peer, 'probe')
+    except Exception as exc:
+        if local['enabled']:
+            result.update(state='needs-attention',
+                          message='peer is unreachable over BatchMode SSH: ' + str(exc))
+        else:
+            result['message'] = 'not enabled; peer is currently unreachable over SSH'
+        return result
+    result['remote'] = remote
+    ident = remote.get('identity') or {}
+    if ident.get('id') != peer['id'] or ident.get('fingerprint') != peer['fingerprint']:
+        result.update(state='needs-attention',
+                      message='peer device identity changed; reauthorize it')
+        return result
+    remote_enabled = bool(remote.get('enabled') and remote.get('peer_id') == local['me_id'])
+    enabled = local['enabled'] and remote_enabled
+    problems = []
+    if local['enabled'] != remote_enabled:
+        problems.append('only one side has opted in towards the other')
+    if remote.get('layout') != local['layout_key']:
+        problems.append('the peer has a different saved Glide layout')
+    if enabled:
+        if not local['hook_ok']:
+            problems.append('the local engine config is missing the enter hook '
+                            '(run reconcile or re-apply the layout)')
+        if not remote.get('hook_ok'):
+            problems.append('the peer’s engine config is missing its enter hook')
+        if not local['deps'] or not remote.get('deps'):
+            problems.append('wl-clipboard (wl-copy/wl-paste) is missing on one side')
+        if not local['helper'] or not remote.get('helper'):
+            problems.append('the installed clipboard helper is missing on one side')
+    result['enabled'] = enabled
+    result['ready'] = enabled and not problems
+    if result['ready']:
+        result['state'] = 'ready'
+        result['message'] = ('both ends opted in and verified; clipboard text '
+                             'follows pointer crossings')
+    elif local['enabled'] or remote_enabled:
+        result['state'] = 'needs-attention'
+        result['message'] = '; '.join(problems)
+    return result
+
+
+def remote_dispatch(action, payload):
+    """The peer-side handler behind '_remote'; strictly allowlisted."""
+    if action == 'probe':
+        return remote_probe()
+    if action == 'snapshot':
+        return pair_snapshot()
+    if action == 'apply':
+        if (not isinstance(payload, dict) or type(payload.get('enabled')) is not bool
+                or not valid_id(payload.get('peer_id'))):
+            raise Failure('invalid apply payload')
+        return pair_apply_settings(payload['peer_id'], payload['enabled'])
+    if action == 'restore':
+        pair_restore(payload)
+        return True
+    raise Failure('invalid remote action')
+
+
+def reconcile():
+    """Reflect a valid saved local clipboard opt-in into the engine config.
+
+    Rewrites the LAN config from the saved layout (atomically, only when it
+    differs) so the opt-in's enter hook is present. Never starts or restarts
+    anything, and refuses an invalid or non-adjacent opted peer instead of
+    guessing.
+    """
+    current = settings()
+    if not current.get('enabled'):
+        return {'changed': False, 'reason': 'text-on-crossing is disabled'}
+    peer_id = current.get('peer_id')
+    if not valid_id(peer_id):
+        raise Failure('saved clipboard opt-in has an invalid peer identity; '
+                      'fix or remove clipboard.json')
+    if adjacent_peer(peer_id) is None:
+        raise Failure('saved clipboard opt-in names a peer that is not adjacent '
+                      'in the saved layout; refusing to guess')
+    me = g.identity()
+    layout = g.read_json(g.CONFIG / 'layout.json', None)
+    if not isinstance(layout, dict):
+        raise Failure('no saved Glide layout')
+    content = g.render_config(layout, me)
+    try:
+        existing = g.LAN_CONFIG.read_text()
+    except OSError:
+        existing = None
+    if existing == content:
+        return {'changed': False, 'reason': 'engine config already matches the saved opt-in'}
+    g.atomic(g.LAN_CONFIG, content)
+    return {'changed': True, 'reason': 'engine config updated to match the saved opt-in'}
+
+
+PAIR_COMMANDS = {'pair-enable': pair_enable, 'pair-disable': pair_disable,
+                 'pair-status': pair_status}
+
+
+def json_cli(fn, *args):
+    """JSON stdout protocol: {"ok": true, "result": ...} / {"ok": false, "error": ...}."""
+    try:
+        print(json.dumps({'ok': True, 'result': fn(*args)}))
+        return 0
+    except (Failure, ValueError, OSError, TimeoutExpired) as exc:
+        # Never include clipboard contents in any error path.
+        print(json.dumps({'ok': False, 'error': str(exc)}))
+        return 1
+
+
+def remote_cli(action):
+    try:
+        raw = sys.stdin.read(PAIR_PAYLOAD_MAX + 1)
+        if len(raw) > PAIR_PAYLOAD_MAX:
+            raise Failure('remote payload is too large')
+        payload = json.loads(raw) if raw.strip() else None
+        result = remote_dispatch(action, payload)
+        print(json.dumps({'ok': True, 'result': result}))
+        return 0
+    except (Failure, ValueError, OSError) as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)}))
+        return 1
+
+
 def main(argv):
     try:
+        if len(argv) == 2 and argv[0] in PAIR_COMMANDS:
+            return json_cli(PAIR_COMMANDS[argv[0]], argv[1])
+        if argv == ['reconcile']:
+            return json_cli(reconcile)
+        if len(argv) == 2 and argv[0] == '_remote':
+            return remote_cli(argv[1])
         if len(argv) == 2 and argv[0] == 'send':
             return send(argv[1])
         if len(argv) == 2 and argv[0] == 'receive':
@@ -257,7 +673,9 @@ def main(argv):
             print(status())
             return 0
         print('usage: glide_clipboard.py send <peerid> | receive <sourceid> | '
-              'enable <peerid> | disable | status', file=sys.stderr)
+              'enable <peerid> | disable | status | reconcile | '
+              'pair-enable <peerid> | pair-disable <peerid> | pair-status <peerid>',
+              file=sys.stderr)
         return 2
     except (TimeoutExpired, OSError):
         print('glide-clipboard: clipboard operation unavailable or timed out', file=sys.stderr)

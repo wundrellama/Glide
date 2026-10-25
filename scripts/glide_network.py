@@ -20,8 +20,8 @@ LAN_CONFIG = Path.home() / '.config/lan-mouse/config.toml'
 STATE = Path.home() / '.local/state/omarchy/glide'
 SERVICE = 'omarchy-glide.service'
 PRIVATE = [ipaddress.ip_network(n) for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16')]
-REMOTE = 'python3 .config/omarchy/plugins/nixfred.glide/scripts/network.py'
-PLUGIN = Path.home() / '.config/omarchy/plugins/nixfred.glide'
+REMOTE = 'python3 .config/omarchy/plugins/wundrellama.glide/scripts/network.py'
+PLUGIN = Path.home() / '.config/omarchy/plugins/wundrellama.glide'
 
 
 def run(argv, **kw):

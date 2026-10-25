@@ -8,8 +8,8 @@ import qs.Ui
 
 Panel {
   id: root
-  moduleName: "nixfred.glide"
-  ipcTarget: "nixfred.glide"
+  moduleName: "wundrellama.glide"
+  ipcTarget: "wundrellama.glide"
   property var state: ({running: false, ready: false, connected: false})
   property var inventory: ({self: {}, devices: [], layout: {machines: []}, lan: []})
   property var draft: []
@@ -17,16 +17,38 @@ Panel {
   property bool dirty: false
   property string message: ""
   property bool failed: false
+  property var clipboardInfo: ({enabled: false, ready: false, state: "off", message: "Select a paired neighbor to configure text sharing."})
+  property bool clipboardLoaded: false
   property real animationPhase: 0
+  readonly property string clipboardHelper: Qt.resolvedUrl("scripts/glide_clipboard.py").toString().replace(/^file:\/\//, "")
   readonly property string helper: Qt.resolvedUrl("scripts/glide-control.py").toString().replace(/^file:\/\//, "")
   readonly property string networkHelper: Qt.resolvedUrl("scripts/network.py").toString().replace(/^file:\/\//, "")
-  readonly property bool busy: apply.running || control.running
+  readonly property bool busy: apply.running || control.running || clipboardControl.running
+  readonly property bool clipboardBusy: clipboardStatus.running || clipboardControl.running
+  readonly property bool clipboardPeerSelected: selectedInLayout && selected !== inventory.self.id && !dirty
+  readonly property string clipboardStatusText: !clipboardPeerSelected ? "Select a saved paired neighbor" : !clipboardLoaded ? "Checking…" : clipboardInfo.state === "ready" ? (state.running ? "Ready" : "Ready · sharing paused") : clipboardInfo.state === "off" ? "Off" : "Needs attention"
   readonly property string statusText: state.error ? "Needs attention" : !state.running ? "Paused" : state.connected ? "Connected" : state.ready ? "Ready to glide" : "Ready"
   readonly property var selectedMachine: draft.find(function(n) { return n.id === root.selected }) || inventory.devices.find(function(n) { return n.id === root.selected }) || null
   readonly property bool selectedInLayout: draft.some(function(n) { return n.id === root.selected })
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
+  function refreshClipboard() {
+    clipboardLoaded = false
+    if (!clipboardPeerSelected || clipboardStatus.running || clipboardControl.running) return
+    clipboardStatus.peer = selected
+    clipboardStatus.command = ["python3", clipboardHelper, "pair-status", selected]
+    clipboardStatus.running = true
+  }
+  function changeClipboard() {
+    if (busy || !clipboardPeerSelected || !clipboardLoaded || clipboardStatus.running) return
+    clipboardControl.peer = selected
+    clipboardControl.command = ["python3", clipboardHelper, clipboardInfo.enabled ? "pair-disable" : "pair-enable", selected]
+    message = "Updating text sharing on both machines…"; failed = false
+    clipboardControl.running = true
+  }
+  onSelectedChanged: Qt.callLater(refreshClipboard)
+  onClipboardPeerSelectedChanged: Qt.callLater(refreshClipboard)
   function refresh() { if (!poll.running) poll.running = true }
   function scan() { if (!scanProcess.running && !apply.running) scanProcess.running = true }
   function reloadDraft() {
@@ -81,20 +103,49 @@ Panel {
     apply.stdinEnabled = true
     apply.running = true
   }
-  onOpenedChanged: if (opened) { refresh(); scan() }
+  onOpenedChanged: if (opened) { refresh(); scan(); refreshClipboard() }
 
   IpcHandler {
     target: "glide-layout"
     function inspect(): string {
       return JSON.stringify({draft:root.draft, saved:root.inventory.layout, selected:root.selected,
         dirty:root.dirty, busy:root.busy, message:root.message, failed:root.failed,
+        clipboard:root.clipboardInfo, clipboardLoaded:root.clipboardLoaded,
         panelWidth:popup.contentWidth, panelHeight:popup.contentHeight,
         contentHeight:content.implicitHeight, availableHeight:popup.availableCardHeight})
     }
     function selectMachine(id: string): void { root.selected=id }
+    function toggleClipboard(): void { root.changeClipboard() }
     function moveSelected(dx: int, dy: int): void { root.nudge(dx,dy) }
     function applyLayout(): void { root.saveLayout() }
     function resetDraft(): void { root.reloadDraft() }
+  }
+  Process {
+    id: clipboardStatus
+    property string peer: ""
+    stdout: StdioCollector { onStreamFinished: {
+      if (clipboardStatus.peer !== root.selected || !root.clipboardPeerSelected) return
+      try {
+        var response = JSON.parse(text)
+        root.clipboardInfo = response.ok ? response.result : {enabled:false, ready:false, state:"needs-attention", message:response.error}
+      } catch(e) { root.clipboardInfo = {enabled:false, ready:false, state:"needs-attention", message:"Could not check text sharing."} }
+      root.clipboardLoaded = true
+    } }
+    onExited: if (peer !== root.selected && root.clipboardPeerSelected) root.refreshClipboard()
+  }
+  Process {
+    id: clipboardControl
+    property string peer: ""
+    stdout: StdioCollector { onStreamFinished: {
+      try {
+        var response = JSON.parse(text)
+        if (response.ok) {
+          if (clipboardControl.peer === root.selected) { root.clipboardInfo=response.result; root.clipboardLoaded=true }
+          root.message=response.result.message; root.failed=false
+        } else { root.message=response.error; root.failed=true }
+      } catch(e) { root.message="Text sharing update failed."; root.failed=true }
+    } }
+    onExited: { root.refresh(); root.refreshClipboard() }
   }
   Process {
     id: poll
@@ -345,6 +396,21 @@ Panel {
         Item { Layout.fillWidth: true }
         Action { text: "Install & authorize"; enabled: !!root.selectedMachine && root.selected!==root.inventory.self.id && !root.busy; onClicked: root.authorize() }
         Action { text: "Remove"; enabled: root.selectedInLayout && root.selected!==root.inventory.self.id && !root.busy; onClicked: root.removeSelected() }
+      }
+      RowLayout {
+        Layout.fillWidth: true
+        ColumnLayout {
+          Layout.fillWidth: true
+          Label { text: "Clipboard text on crossing"; font.bold: true }
+          Label { Layout.fillWidth: true; text: root.clipboardStatusText + " · " + root.clipboardInfo.message; font.pixelSize: Style.font.caption; color: Qt.alpha(Commons.Color.foreground,0.7) }
+        }
+        ToggleSwitch {
+          objectName: "glide-clipboard-toggle"
+          checked: root.clipboardInfo.enabled
+          busy: root.busy || root.clipboardBusy
+          enabled: root.clipboardPeerSelected && root.clipboardLoaded && !busy
+          onToggled: root.changeClipboard()
+        }
       }
       RowLayout {
         Layout.fillWidth: true

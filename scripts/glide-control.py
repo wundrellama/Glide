@@ -7,11 +7,41 @@ from pathlib import Path
 import socket
 import subprocess
 import shlex
+import sys
 import tomllib
 
 UNIT = 'omarchy-glide.service'
 IDLE_UNIT = 'omarchy-glide-idle.service'
-PLUGIN_SCRIPT = '.config/omarchy/plugins/nixfred.glide/scripts/glide-control.py'
+PLUGIN_SCRIPT = '.config/omarchy/plugins/wundrellama.glide/scripts/glide-control.py'
+
+
+def clipboard_status():
+    """Local clipboard opt-in config only: no SSH, safe on a fast poll."""
+    try:
+        data = json.loads((Path.home() / '.config/omarchy-glide/clipboard.json').read_text())
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    peer = data.get('peer_id')
+    return {'enabled': bool(data.get('enabled')), 'peer_id': peer if isinstance(peer, str) else ''}
+
+
+def reconcile_clipboard():
+    """Fail closed unless the saved clipboard opt-in matches the engine config."""
+    helper = Path(__file__).resolve().parent / 'glide_clipboard.py'
+    try:
+        result = subprocess.run([sys.executable, str(helper), 'reconcile'],
+                                capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit(f'Clipboard reconciliation unavailable: {exc}')
+    if result.returncode:
+        try:
+            detail = json.loads(result.stdout).get('error', '')
+        except ValueError:
+            detail = (result.stderr or result.stdout).strip()
+        raise SystemExit('Clipboard reconciliation failed: '
+                         + (detail or f'exit {result.returncode}'))
 
 def peer_targets():
     """Return every paired SSH target from Glide's verified layout."""
@@ -63,7 +93,8 @@ def remote_action(action):
 
 def status():
     result = {'running': False, 'ready': False, 'host': socket.gethostname(),
-              'peer': '', 'position': 'left', 'connected': False, 'error': ''}
+              'peer': '', 'position': 'left', 'connected': False, 'error': '',
+              'clipboard': clipboard_status()}
     try:
         config = tomllib.loads((Path.home() / '.config/lan-mouse/config.toml').read_text())
         clients = config.get('clients', [])
@@ -118,6 +149,7 @@ def main():
         print(json.dumps(status()))
         return
     if args.action == 'settings':
+        reconcile_clipboard()
         subprocess.run(['systemctl', '--user', 'start', UNIT, IDLE_UNIT], check=True, timeout=10)
         subprocess.Popen(['/usr/bin/lan-mouse'], start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -130,6 +162,7 @@ def main():
     if action == 'pause':
         subprocess.run(['systemctl', '--user', 'stop', IDLE_UNIT, UNIT], check=True, timeout=10)
     else:
+        reconcile_clipboard()
         subprocess.run(['systemctl', '--user', 'start', UNIT, IDLE_UNIT], check=True, timeout=10)
     if not args.local_only:
         ok, error = remote_action(action)
