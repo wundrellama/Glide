@@ -153,6 +153,16 @@ impl InputEmulation {
         }
     }
 
+    /// place the pointer at normalized (`0.0..=1.0`) screen coordinates
+    pub async fn warp(
+        &mut self,
+        handle: EmulationHandle,
+        x: f64,
+        y: f64,
+    ) -> Result<(), EmulationError> {
+        self.emulation.warp(handle, x, y).await
+    }
+
     pub async fn create(&mut self, handle: EmulationHandle) -> bool {
         if self.handles.insert(handle) {
             self.pressed_keys.insert(handle, HashSet::new());
@@ -234,7 +244,93 @@ trait Emulation: Send {
         event: Event,
         handle: EmulationHandle,
     ) -> Result<(), EmulationError>;
+    /// place the pointer at normalized (`0.0..=1.0`) screen coordinates,
+    /// e.g. the point a peer's cursor entered this device; backends
+    /// without pointer placement ignore the request
+    async fn warp(
+        &mut self,
+        handle: EmulationHandle,
+        x: f64,
+        y: f64,
+    ) -> Result<(), EmulationError> {
+        let _ = (handle, x, y);
+        Ok(())
+    }
     async fn create(&mut self, handle: EmulationHandle);
     async fn destroy(&mut self, handle: EmulationHandle);
     async fn terminate(&mut self);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct WarpLog {
+        warps: Vec<(EmulationHandle, f64, f64)>,
+    }
+
+    struct WarpStub(Arc<Mutex<WarpLog>>);
+
+    #[async_trait]
+    impl Emulation for WarpStub {
+        async fn consume(
+            &mut self,
+            _event: Event,
+            _handle: EmulationHandle,
+        ) -> Result<(), EmulationError> {
+            Ok(())
+        }
+        async fn warp(
+            &mut self,
+            handle: EmulationHandle,
+            x: f64,
+            y: f64,
+        ) -> Result<(), EmulationError> {
+            self.0.lock().unwrap().warps.push((handle, x, y));
+            Ok(())
+        }
+        async fn create(&mut self, _handle: EmulationHandle) {}
+        async fn destroy(&mut self, _handle: EmulationHandle) {}
+        async fn terminate(&mut self) {}
+    }
+
+    struct NoopStub;
+
+    #[async_trait]
+    impl Emulation for NoopStub {
+        async fn consume(
+            &mut self,
+            _event: Event,
+            _handle: EmulationHandle,
+        ) -> Result<(), EmulationError> {
+            Ok(())
+        }
+        async fn create(&mut self, _handle: EmulationHandle) {}
+        async fn destroy(&mut self, _handle: EmulationHandle) {}
+        async fn terminate(&mut self) {}
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn warp_forwards_normalized_coordinates_to_backend() {
+        let log = Arc::new(Mutex::new(WarpLog::default()));
+        let mut emulation = InputEmulation {
+            emulation: Box::new(WarpStub(log.clone())),
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+        };
+        emulation.warp(7, 0.25, 0.75).await.expect("warp");
+        assert_eq!(log.lock().unwrap().warps, vec![(7, 0.25, 0.75)]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn warp_defaults_to_noop() {
+        let mut emulation = InputEmulation {
+            emulation: Box::new(NoopStub),
+            handles: HashSet::new(),
+            pressed_keys: HashMap::new(),
+        };
+        emulation.warp(0, 0.5, 0.5).await.expect("warp");
+    }
 }

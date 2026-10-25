@@ -66,6 +66,8 @@ Connections follow the nearest machine in the same row or column. Diagonal-only 
 
 If you release control while resting on a screen edge, move inward before crossing again. Glide suppresses immediate recapture for 250 ms and rejects entry retries for 500 ms after physical takeover.
 
+**Coordinate-aware crossing (new, unverified live):** the engine now carries the crossing point along an edge (a normalized fraction) through the handoff in both directions. When a peer's pointer enters this machine, the pointer is placed at the entered edge at that fraction before subsequent input arrives; when control returns to this machine, the capture side warps the pointer just inside the same relative edge position via the compositor's `wp_pointer_warp_v1` protocol, instead of resurrecting it wherever it was parked while hidden. Emergency release, disconnects, and physical takeover never warp. Both machines must run the rebuilt engine together — the wire format changed with no compatibility fallback for older builds. This has **not yet been verified on a live deployment**; if a compositor does not advertise pointer warping, the engine logs a warning at startup and returns behave as before.
+
 ## Troubleshooting
 
 **Release a trapped pointer:** press Left Ctrl + Left Shift + Esc on the sending keyboard. To pause sharing from a terminal on either computer:

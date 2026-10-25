@@ -29,6 +29,7 @@ use wayland_protocols::{
             zwp_locked_pointer_v1::ZwpLockedPointerV1,
             zwp_pointer_constraints_v1::{Lifetime, ZwpPointerConstraintsV1},
         },
+        pointer_warp::v1::client::wp_pointer_warp_v1::WpPointerWarpV1,
         relative_pointer::zv1::client::{
             zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
             zwp_relative_pointer_v1::{self, ZwpRelativePointerV1},
@@ -76,6 +77,7 @@ struct Globals {
     pointer_constraints: ZwpPointerConstraintsV1,
     relative_pointer_manager: ZwpRelativePointerManagerV1,
     shortcut_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
+    pointer_warp: Option<WpPointerWarpV1>,
     seat: wl_seat::WlSeat,
     shm: wl_shm::WlShm,
     layer_shell: ZwlrLayerShellV1,
@@ -132,6 +134,9 @@ struct State {
     outputs: Vec<Output>,
     scroll_discrete_pending: bool,
     last_ungrab: Option<Instant>,
+    /// serial of the pointer enter that started the current grab, required
+    /// for set_cursor / pointer warp requests before the grab is released
+    enter_serial: Option<u32>,
 }
 
 struct Inner {
@@ -152,6 +157,8 @@ struct Window {
     surface: WlSurface,
     layer_surface: ZwlrLayerSurfaceV1,
     pos: Position,
+    width: u32,
+    height: u32,
 }
 
 impl Window {
@@ -211,6 +218,8 @@ impl Window {
             buffer,
             surface,
             layer_surface,
+            width,
+            height,
         }
     }
 }
@@ -314,6 +323,19 @@ impl LayerShellInputCapture {
         }
         let shortcut_inhibit_manager = shortcut_inhibit_manager.ok();
 
+        // optional pointer warp protocol: lets us place the cursor exactly
+        // when releasing a captured pointer back to this host
+        let pointer_warp: Result<WpPointerWarpV1, WaylandBindError> = global_list
+            .bind(&qh, 1..=1, ())
+            .map_err(|e| WaylandBindError::new(e, "wp_pointer_warp_v1"));
+        if let Err(e) = &pointer_warp {
+            log::warn!(
+                "pointer_warp not supported: {e}\n\
+                the pointer will not be repositioned when returning from a peer"
+            );
+        }
+        let pointer_warp = pointer_warp.ok();
+
         let mut state = State {
             active_positions: Default::default(),
             pointer: None,
@@ -327,6 +349,7 @@ impl LayerShellInputCapture {
                 pointer_constraints,
                 relative_pointer_manager,
                 shortcut_inhibit_manager,
+                pointer_warp,
                 xdg_output_manager,
             },
             pointer_lock: None,
@@ -341,6 +364,7 @@ impl LayerShellInputCapture {
             outputs: vec![],
             scroll_discrete_pending: false,
             last_ungrab: None,
+            enter_serial: None,
         };
 
         for global in state.global_list.contents().clone_list() {
@@ -491,6 +515,7 @@ impl State {
             return;
         }
         self.last_ungrab = Some(Instant::now());
+        self.enter_serial = None;
         self.pending_events.clear();
         // get focused client
         let window = match self.focused.as_ref() {
@@ -521,6 +546,42 @@ impl State {
             shortcut_inhibitor.destroy();
             self.shortcut_inhibitor = None;
         }
+    }
+
+    /* Place the pointer just past the crossed barrier at the given edge
+     * fraction BEFORE the grab is released: while the barrier surface
+     * still has pointer focus, the stored enter serial satisfies the
+     * compositor's warp validation (Hyprland requires the current
+     * pointer focus to be this surface with its enter serial). The
+     * target is inset to the interior side of the one-pixel barrier so
+     * the released pointer does not immediately re-enter it.
+     * `wl_pointer.set_cursor_position_hint` is not available with the
+     * pinned wayland-client XML, so compositors without
+     * wp_pointer_warp_v1 degrade to a plain release. */
+    fn place_pointer_at_edge(&mut self, fraction: f64) {
+        let Some(pointer_warp) = &self.globals.pointer_warp else {
+            log::warn!(
+                "pointer_warp unavailable: cannot place pointer at edge fraction {fraction}"
+            );
+            return;
+        };
+        let (Some(window), Some(pointer), Some(serial)) = (
+            self.focused.as_ref(),
+            self.pointer.as_ref(),
+            self.enter_serial,
+        ) else {
+            log::warn!(
+                "cannot place pointer at edge fraction {fraction}: \
+                 no focused surface, pointer or enter serial"
+            );
+            return;
+        };
+        let (x, y) = release_target(window.pos, fraction, window.width, window.height);
+        log::debug!(
+            "placing pointer at ({x}, {y}) on {} barrier (fraction {fraction})",
+            window.pos
+        );
+        pointer_warp.warp_pointer(&window.surface, pointer, x, y, serial);
     }
 
     fn add_client(&mut self, pos: Position) {
@@ -629,7 +690,7 @@ impl Inner {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl Capture for LayerShellInputCapture {
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.add_client(pos);
@@ -646,6 +707,16 @@ impl Capture for LayerShellInputCapture {
     async fn release(&mut self) -> Result<(), CaptureError> {
         log::debug!("releasing pointer");
         let inner = self.0.get_mut();
+        inner.state.ungrab();
+        Ok(inner.flush_events()?)
+    }
+
+    async fn release_at(&mut self, fraction: Option<f64>) -> Result<(), CaptureError> {
+        log::debug!("releasing pointer at edge fraction {fraction:?}");
+        let inner = self.0.get_mut();
+        if let Some(fraction) = fraction {
+            inner.state.place_pointer_at_edge(fraction);
+        }
         inner.state.ungrab();
         Ok(inner.flush_events()?)
     }
@@ -750,8 +821,8 @@ impl Dispatch<WlPointer, ()> for State {
             wl_pointer::Event::Enter {
                 serial,
                 surface,
-                surface_x: _,
-                surface_y: _,
+                surface_x,
+                surface_y,
             } => {
                 // Focus changes on unlock can immediately re-enter this one-pixel
                 // surface without physical motion. Do not lock it again in that
@@ -760,21 +831,26 @@ impl Dispatch<WlPointer, ()> for State {
                     return;
                 }
                 // get client corresponding to the focused surface
-                {
-                    if let Some(window) = app.active_windows.iter().find(|w| w.surface == surface) {
-                        app.focused = Some(window.clone());
-                        app.grab(&surface, pointer, serial, qh);
-                    } else {
-                        return;
-                    }
-                }
-                let pos = app
+                let Some(window) = app
                     .active_windows
                     .iter()
                     .find(|w| w.surface == surface)
-                    .map(|w| w.pos)
-                    .unwrap();
-                app.pending_events.push_back((pos, CaptureEvent::Begin));
+                    .cloned()
+                else {
+                    return;
+                };
+                app.focused = Some(window.clone());
+                app.enter_serial = Some(serial);
+                app.grab(&surface, pointer, serial, qh);
+                let fraction = enter_fraction(
+                    window.pos,
+                    surface_x,
+                    surface_y,
+                    window.width,
+                    window.height,
+                );
+                app.pending_events
+                    .push_back((window.pos, CaptureEvent::Begin(fraction)));
             }
             wl_pointer::Event::Leave { .. } => {
                 /* There are rare cases, where when a window is opened in
@@ -848,6 +924,44 @@ fn edge_rearmed(last_ungrab: Option<Instant>, now: Instant) -> bool {
     last_ungrab.is_none_or(|when| now.duration_since(when) >= Duration::from_millis(250))
 }
 
+/// normalized crossing fraction (`0.0..=1.0`) along the barrier's long
+/// axis; fails closed (`None`) when the barrier metadata is unusable
+fn enter_fraction(
+    pos: Position,
+    surface_x: f64,
+    surface_y: f64,
+    width: u32,
+    height: u32,
+) -> Option<f64> {
+    let (along, dim) = match pos {
+        Position::Left | Position::Right => (surface_y, height),
+        Position::Top | Position::Bottom => (surface_x, width),
+    };
+    if dim == 0 || !along.is_finite() {
+        return None;
+    }
+    let fraction = along / f64::from(dim);
+    (fraction.is_finite() && (0.0..=1.0).contains(&fraction)).then_some(fraction)
+}
+
+/// surface-local pointer target just past the one-pixel barrier on the
+/// interior side, so the released pointer neither re-enters the barrier
+/// nor lands on a corner; compositors expand the surface box by one
+/// pixel when hit-testing, so 0.5px past the barrier is still warpable
+fn release_target(pos: Position, fraction: f64, width: u32, height: u32) -> (f64, f64) {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let along = |dim: u32| {
+        let dim = f64::from(dim);
+        (fraction * dim).clamp(1.0, (dim - 2.0).max(1.0))
+    };
+    match pos {
+        Position::Left => (1.5, along(height)),
+        Position::Right => (-0.5, along(height)),
+        Position::Top => (along(width), 1.5),
+        Position::Bottom => (along(width), -0.5),
+    }
+}
+
 #[cfg(test)]
 mod glide_tests {
     use super::*;
@@ -859,6 +973,81 @@ mod glide_tests {
         assert!(!edge_rearmed(Some(now), now));
         assert!(!edge_rearmed(Some(now), now + Duration::from_millis(249)));
         assert!(edge_rearmed(Some(now), now + Duration::from_millis(250)));
+    }
+}
+
+#[cfg(test)]
+mod edge_fraction_tests {
+    use super::*;
+
+    #[test]
+    fn vertical_edges_use_height_fraction() {
+        assert_eq!(
+            enter_fraction(Position::Left, 0.5, 450.0, 1, 1350),
+            Some(450.0 / 1350.0)
+        );
+        assert_eq!(
+            enter_fraction(Position::Right, 0.5, 675.0, 1, 1350),
+            Some(0.5)
+        );
+    }
+
+    #[test]
+    fn horizontal_edges_use_width_fraction() {
+        assert_eq!(
+            enter_fraction(Position::Top, 600.0, 0.5, 2400, 1),
+            Some(0.25)
+        );
+        assert_eq!(
+            enter_fraction(Position::Bottom, 1200.0, 0.5, 2400, 1),
+            Some(0.5)
+        );
+    }
+
+    #[test]
+    fn fails_closed_on_bad_metadata() {
+        // zero-sized barrier
+        assert_eq!(enter_fraction(Position::Left, 0.0, 5.0, 1, 0), None);
+        assert_eq!(enter_fraction(Position::Top, 5.0, 0.0, 0, 1), None);
+        // non-finite coordinates
+        assert_eq!(enter_fraction(Position::Left, 0.0, f64::NAN, 1, 1350), None);
+        assert_eq!(
+            enter_fraction(Position::Top, f64::INFINITY, 0.0, 2400, 1),
+            None
+        );
+        // coordinate outside the barrier
+        assert_eq!(enter_fraction(Position::Right, 0.0, 2000.0, 1, 1350), None);
+        assert_eq!(enter_fraction(Position::Left, 0.0, -1.0, 1, 1350), None);
+    }
+}
+
+#[cfg(test)]
+mod release_target_tests {
+    use super::*;
+
+    #[test]
+    fn target_insets_past_barrier_on_the_interior_side() {
+        assert_eq!(release_target(Position::Left, 0.5, 1, 1350), (1.5, 675.0));
+        assert_eq!(release_target(Position::Right, 0.5, 1, 1350), (-0.5, 675.0));
+        assert_eq!(release_target(Position::Top, 0.25, 2400, 1), (600.0, 1.5));
+        assert_eq!(
+            release_target(Position::Bottom, 0.25, 2400, 1),
+            (600.0, -0.5)
+        );
+    }
+
+    #[test]
+    fn along_coordinate_is_clamped_away_from_corners() {
+        assert_eq!(release_target(Position::Left, 0.0, 1, 1350).1, 1.0);
+        assert_eq!(release_target(Position::Left, 1.0, 1, 1350).1, 1348.0);
+        assert_eq!(release_target(Position::Top, 0.0, 2400, 1).0, 1.0);
+        assert_eq!(release_target(Position::Top, 1.0, 2400, 1).0, 2398.0);
+    }
+
+    #[test]
+    fn out_of_range_fractions_are_clamped() {
+        assert_eq!(release_target(Position::Left, -1.0, 1, 1350).1, 1.0);
+        assert_eq!(release_target(Position::Left, 2.0, 1, 1350).1, 1348.0);
     }
 }
 
@@ -923,22 +1112,57 @@ impl Dispatch<ZwpRelativePointerV1, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let zwp_relative_pointer_v1::Event::RelativeMotion {
-            utime_hi,
-            utime_lo,
-            dx_unaccel: dx,
-            dy_unaccel: dy,
-            ..
-        } = event
-        {
+        if let Some(motion) = relative_motion_event(event) {
             if let Some(window) = &app.focused {
-                let time = ((((utime_hi as u64) << 32) | utime_lo as u64) / 1000) as u32;
-                app.pending_events.push_back((
-                    window.pos,
-                    CaptureEvent::Input(Event::Pointer(PointerEvent::Motion { time, dx, dy })),
-                ));
+                app.pending_events
+                    .push_back((window.pos, CaptureEvent::Input(Event::Pointer(motion))));
             }
         }
+    }
+}
+
+fn relative_motion_event(event: zwp_relative_pointer_v1::Event) -> Option<PointerEvent> {
+    if let zwp_relative_pointer_v1::Event::RelativeMotion {
+        utime_hi,
+        utime_lo,
+        // Match the source compositor's cursor motion. The wlroots virtual
+        // pointer consumes these as screen deltas without a libinput device
+        // acceleration pass; raw counts would discard the source mouse's
+        // speed/DPI normalization and change its feel at every crossing.
+        dx,
+        dy,
+        ..
+    } = event
+    {
+        let time = ((((utime_hi as u64) << 32) | utime_lo as u64) / 1000) as u32;
+        Some(PointerEvent::Motion { time, dx, dy })
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_motion_matches_source_compositor_not_raw_device_counts() {
+        let event = zwp_relative_pointer_v1::Event::RelativeMotion {
+            utime_hi: 0,
+            utime_lo: 250_000,
+            dx: 2.5,
+            dy: -1.25,
+            dx_unaccel: 20.0,
+            dy_unaccel: -10.0,
+        };
+        assert_eq!(
+            relative_motion_event(event),
+            Some(PointerEvent::Motion {
+                time: 250,
+                dx: 2.5,
+                dy: -1.25
+            })
+        );
     }
 }
 
@@ -1064,6 +1288,7 @@ delegate_noop!(State: ZwlrLayerShellV1);
 delegate_noop!(State: ZwpRelativePointerManagerV1);
 delegate_noop!(State: ZwpKeyboardShortcutsInhibitManagerV1);
 delegate_noop!(State: ZwpPointerConstraintsV1);
+delegate_noop!(State: WpPointerWarpV1);
 
 // ignore events
 delegate_noop!(State: ignore ZxdgOutputManagerV1);

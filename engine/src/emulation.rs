@@ -53,14 +53,15 @@ pub(crate) enum EmulationEvent {
     EmulationDisabled,
     /// emulation was enabled
     EmulationEnabled,
-    /// capture should be released
-    ReleaseNotify,
+    /// capture should be released; a fraction requests a geometric
+    /// release placing the pointer along the crossed edge
+    ReleaseNotify(Option<f64>),
 }
 
 enum EmulationRequest {
     Reenable,
     TakeLocalOwnership,
-    Release(SocketAddr),
+    Release(SocketAddr, Option<f64>),
     ChangePort(u16),
     Terminate,
 }
@@ -69,6 +70,7 @@ impl Emulation {
     pub(crate) fn new(
         backend: Option<input_emulation::Backend>,
         listener: LanMouseListener,
+        outgoing_capture_active: Rc<Cell<bool>>,
     ) -> Self {
         let emulation_proxy = EmulationProxy::new(backend);
         let (request_tx, request_rx) = channel();
@@ -76,6 +78,7 @@ impl Emulation {
         let emulation_task = ListenTask {
             listener,
             emulation_proxy,
+            outgoing_capture_active,
             request_rx,
             event_tx,
         };
@@ -87,9 +90,9 @@ impl Emulation {
         }
     }
 
-    pub(crate) fn send_leave_event(&self, addr: SocketAddr) {
+    pub(crate) fn send_leave_event(&self, addr: SocketAddr, fraction: Option<f64>) {
         self.request_tx
-            .send(EmulationRequest::Release(addr))
+            .send(EmulationRequest::Release(addr, fraction))
             .expect("channel closed");
     }
 
@@ -130,6 +133,10 @@ impl Emulation {
 struct ListenTask {
     listener: LanMouseListener,
     emulation_proxy: EmulationProxy,
+    /// true while this host's pointer is captured by a peer (outgoing
+    /// handoff); shared with the service, which learns the state from
+    /// capture events
+    outgoing_capture_active: Rc<Cell<bool>>,
     request_rx: Receiver<EmulationRequest>,
     event_tx: Sender<EmulationEvent>,
 }
@@ -147,22 +154,29 @@ impl ListenTask {
                         log::trace!("{event} <-<-<-<-<- {addr}");
                         last_response.insert(addr, Instant::now());
                         match event {
-                            ProtoEvent::Enter(pos) => {
+                            ProtoEvent::Enter(pos, fraction) => {
                                 if let Some(fingerprint) = self.listener.get_certificate_fingerprint(addr).await {
-                                    match ownership.enter(addr) {
+                                    let disposition = ownership.enter(addr);
+                                    if should_warp_on_enter(&disposition, fraction, self.outgoing_capture_active.get()) {
+                                        // place the pointer at the crossing point before any
+                                        // subsequent input events of this handoff are consumed
+                                        let (x, y) = entry_coordinates(pos, fraction.expect("warp checked"));
+                                        self.emulation_proxy.warp(addr, x, y);
+                                    }
+                                    match disposition {
                                         EnterDisposition::New => {
                                             log::info!("releasing capture: {addr} entered this device");
-                                            self.event_tx.send(EmulationEvent::ReleaseNotify).expect("channel closed");
+                                            self.event_tx.send(EmulationEvent::ReleaseNotify(fraction)).expect("channel closed");
                                             self.listener.reply(addr, ProtoEvent::Ack(0)).await;
                                             self.event_tx.send(EmulationEvent::Entered{addr, pos: to_ipc_pos(pos), fingerprint}).expect("channel closed");
                                             self.event_tx.send(EmulationEvent::RemoteControlActive).expect("channel closed");
                                         }
                                         EnterDisposition::Repeat => self.listener.reply(addr, ProtoEvent::Ack(0)).await,
-                                        EnterDisposition::Revoked => self.listener.reply(addr, ProtoEvent::Leave(0)).await,
+                                        EnterDisposition::Revoked => self.listener.reply(addr, ProtoEvent::Leave(0, None)).await,
                                     }
                                 }
                             }
-                            ProtoEvent::Leave(_) => {
+                            ProtoEvent::Leave(..) => {
                                 ownership.leave(addr);
                                 self.emulation_proxy.remove(addr);
                                 self.event_tx.send(EmulationEvent::IncomingControlInactive).expect("channel closed");
@@ -174,7 +188,7 @@ impl ListenTask {
                                     self.emulation_proxy.consume(event, addr);
                                 } else {
                                     // Repeat Leave if a datagram was lost; never replay stale keys.
-                                    self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                                    self.listener.reply(addr, ProtoEvent::Leave(0, None)).await;
                                 }
                             },
                             ProtoEvent::Ping => self.listener.reply(addr, ProtoEvent::Pong(self.emulation_proxy.emulation_active.get())).await,
@@ -199,12 +213,12 @@ impl ListenTask {
                     // reenable emulation
                     EmulationRequest::Reenable => self.emulation_proxy.reenable(),
                     // notify the other end that we hit a barrier (should release capture)
-                    EmulationRequest::Release(addr) => {
+                    EmulationRequest::Release(addr, fraction) => {
                         ownership.leave(addr);
                         self.emulation_proxy.remove(addr);
                         self.event_tx.send(EmulationEvent::IncomingControlInactive).expect("channel closed");
                         self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
-                        self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                        self.listener.reply(addr, ProtoEvent::Leave(0, fraction)).await;
                     },
                     EmulationRequest::TakeLocalOwnership => {
                         let revoked = ownership.take_local();
@@ -214,7 +228,7 @@ impl ListenTask {
                             self.emulation_proxy.remove(addr);
                             self.event_tx.send(EmulationEvent::IncomingControlInactive).expect("channel closed");
                             self.event_tx.send(EmulationEvent::Disconnected { addr }).expect("channel closed");
-                            self.listener.reply(addr, ProtoEvent::Leave(0)).await;
+                            self.listener.reply(addr, ProtoEvent::Leave(0, None)).await;
                         }
                         if took_local {
                             self.event_tx.send(EmulationEvent::LocalOwnershipTaken).expect("channel closed");
@@ -259,6 +273,9 @@ pub(crate) struct EmulationProxy {
 
 enum ProxyRequest {
     Input(Event, SocketAddr),
+    /// place the pointer at normalized screen coordinates for the given
+    /// peer's virtual input before any of its subsequent input events
+    Warp(SocketAddr, f64, f64),
     Remove(SocketAddr),
     Terminate,
     Reenable,
@@ -308,6 +325,15 @@ impl EmulationProxy {
         }
     }
 
+    fn warp(&self, addr: SocketAddr, x: f64, y: f64) {
+        // ignore warps if emulation is currently disabled
+        if self.emulation_active.get() {
+            self.request_tx
+                .send(ProxyRequest::Warp(addr, x, y))
+                .expect("channel closed");
+        }
+    }
+
     fn remove(&self, addr: SocketAddr) {
         self.request_tx
             .send(ProxyRequest::Remove(addr))
@@ -339,6 +365,23 @@ struct EmulationTask {
 }
 
 impl EmulationTask {
+    async fn get_or_create_handle(
+        &mut self,
+        emulation: &mut InputEmulation,
+        addr: SocketAddr,
+    ) -> EmulationHandle {
+        match self.handles.get(&addr) {
+            Some(&handle) => handle,
+            None => {
+                let handle = self.next_id;
+                self.next_id += 1;
+                emulation.create(handle).await;
+                self.handles.insert(addr, handle);
+                handle
+            }
+        }
+    }
+
     async fn run(mut self) {
         loop {
             if let Err(e) = self.do_emulation().await {
@@ -353,6 +396,7 @@ impl EmulationTask {
                     ProxyRequest::Reenable => break,
                     ProxyRequest::Terminate => return,
                     ProxyRequest::Input(..) => { /* emulation inactive => ignore */ }
+                    ProxyRequest::Warp(..) => { /* emulation inactive => ignore */ }
                     ProxyRequest::Remove(..) => { /* emulation inactive => ignore */ }
                 }
             }
@@ -407,17 +451,12 @@ impl EmulationTask {
             tokio::select! {
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     ProxyRequest::Input(event, addr) => {
-                        let handle = match self.handles.get(&addr) {
-                            Some(&handle) => handle,
-                            None => {
-                                let handle = self.next_id;
-                                self.next_id += 1;
-                                emulation.create(handle).await;
-                                self.handles.insert(addr, handle);
-                                handle
-                            }
-                        };
+                        let handle = self.get_or_create_handle(emulation, addr).await;
                         emulation.consume(event, handle).await?;
+                    },
+                    ProxyRequest::Warp(addr, x, y) => {
+                        let handle = self.get_or_create_handle(emulation, addr).await;
+                        emulation.warp(handle, x, y).await?;
                     },
                     ProxyRequest::Remove(addr) => {
                         if let Some(handle) = self.handles.remove(&addr) {
@@ -446,10 +485,39 @@ async fn wait_for_termination(rx: &mut Receiver<ProxyRequest>) {
         match rx.recv().await.expect("channel closed") {
             ProxyRequest::Terminate => return,
             ProxyRequest::Input(_, _) => continue,
+            ProxyRequest::Warp(..) => continue,
             ProxyRequest::Remove(_) => continue,
             ProxyRequest::Reenable => continue,
         }
     }
+}
+
+/// normalized screen coordinates of the point a cursor enters this
+/// device: the entered edge at the given fraction along it
+fn entry_coordinates(pos: Position, fraction: f64) -> (f64, f64) {
+    // Stay inside the display, not on its one-pixel capture barriers.
+    // At the supported 2400x1350 logical size this leaves 1.35–2.4px
+    // clearance; an exact edge/corner placement immediately recaptures.
+    const INSET: f64 = 0.001;
+    let fraction = fraction.clamp(INSET, 1.0 - INSET);
+    match pos {
+        Position::Left => (INSET, fraction),
+        Position::Right => (1.0 - INSET, fraction),
+        Position::Top => (fraction, INSET),
+        Position::Bottom => (fraction, 1.0 - INSET),
+    }
+}
+
+/// an incoming handoff places the pointer via emulation only when it is
+/// a fresh ownership transfer with crossing geometry; while an outgoing
+/// capture is active the capture-side release warp is authoritative and
+/// an emulation warp would be a spurious second warp
+fn should_warp_on_enter(
+    disposition: &EnterDisposition,
+    fraction: Option<f64>,
+    outgoing_capture_active: bool,
+) -> bool {
+    matches!(disposition, EnterDisposition::New) && fraction.is_some() && !outgoing_capture_active
 }
 
 struct DropGuard<T> {
@@ -514,6 +582,66 @@ impl PointerOwnership {
             self.revoked.insert(addr, Instant::now());
         }
         peers
+    }
+}
+
+#[cfg(test)]
+mod warp_tests {
+    use super::*;
+
+    #[test]
+    fn entry_coordinates_map_position_and_fraction_to_normalized_edge_point() {
+        assert_eq!(entry_coordinates(Position::Left, 0.25), (0.001, 0.25));
+        assert_eq!(entry_coordinates(Position::Right, 0.75), (0.999, 0.75));
+        assert_eq!(entry_coordinates(Position::Top, 0.5), (0.5, 0.001));
+        assert_eq!(entry_coordinates(Position::Bottom, 0.5), (0.5, 0.999));
+    }
+
+    #[test]
+    fn entry_placement_is_inside_screen_not_on_a_recapture_barrier() {
+        for pos in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            for fraction in [0.0, 0.5, 1.0] {
+                let (x, y) = entry_coordinates(pos, fraction);
+                assert!(
+                    x > 0.0 && x < 1.0 && y > 0.0 && y < 1.0,
+                    "entry must be inside screen, not an edge barrier: {pos:?} ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn warp_only_for_new_ownership_with_geometry_and_no_outgoing_capture() {
+        assert!(should_warp_on_enter(
+            &EnterDisposition::New,
+            Some(0.5),
+            false
+        ));
+        // a repeated Enter (retry waiting for Ack) must not warp again
+        assert!(!should_warp_on_enter(
+            &EnterDisposition::Repeat,
+            Some(0.5),
+            false
+        ));
+        assert!(!should_warp_on_enter(
+            &EnterDisposition::Revoked,
+            Some(0.5),
+            false
+        ));
+        // no crossing geometry: fail closed
+        assert!(!should_warp_on_enter(&EnterDisposition::New, None, false));
+        // outgoing capture active: the capture-side warp on release is
+        // authoritative, an emulation warp would be a spurious second warp
+        assert!(!should_warp_on_enter(
+            &EnterDisposition::New,
+            Some(0.5),
+            true
+        ));
     }
 }
 

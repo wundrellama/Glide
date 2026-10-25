@@ -159,6 +159,27 @@ impl Emulation for WlrootsEmulation {
         Ok(())
     }
 
+    async fn warp(
+        &mut self,
+        handle: EmulationHandle,
+        x: f64,
+        y: f64,
+    ) -> Result<(), EmulationError> {
+        if let Some(virtual_input) = self.state.input_for_client.get(&handle) {
+            virtual_input.warp(x, y);
+            match self.queue.flush() {
+                Err(WaylandError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.last_flush_failed = true;
+                    log::warn!("can't keep up, discarding warp: ({handle})");
+                }
+                Err(WaylandError::Protocol(e)) => panic!("wayland protocol violation: {e}"),
+                Ok(()) => self.last_flush_failed = false,
+                Err(e) => Err(e)?,
+            }
+        }
+        Ok(())
+    }
+
     async fn create(&mut self, handle: EmulationHandle) {
         self.state.add_client(handle);
         if let Err(e) = self.queue.flush() {
@@ -183,6 +204,19 @@ struct VirtualInput {
 }
 
 impl VirtualInput {
+    /// absolute pointer placement at normalized coordinates, framed so the
+    /// position applies before any subsequently queued input events
+    fn warp(&self, x: f64, y: f64) {
+        let now: u32 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u32;
+        let (x, y) = absolute_coordinates(x, y);
+        self.pointer
+            .motion_absolute(now, x, y, ABSOLUTE_EXTENT, ABSOLUTE_EXTENT);
+        self.pointer.frame();
+    }
+
     fn consume_event(&self, event: Event) -> Result<(), ()> {
         let now: u32 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -370,5 +404,38 @@ impl XMods {
 
     fn mask_pressed(&self) -> XMods {
         *self & (XMods::ShiftMask | XMods::ControlMask | XMods::Mod1Mask | XMods::Mod4Mask)
+    }
+}
+
+/// fixed extent the virtual pointer's absolute coordinates are mapped to
+const ABSOLUTE_EXTENT: u32 = 65536;
+
+/// normalized (`0.0..=1.0`) coordinates to absolute virtual pointer
+/// coordinates; non-finite input fails closed to the origin
+fn absolute_coordinates(x: f64, y: f64) -> (u32, u32) {
+    let to_abs = |v: f64| {
+        if !v.is_finite() {
+            return 0;
+        }
+        (v.clamp(0.0, 1.0) * f64::from(ABSOLUTE_EXTENT - 1)).round() as u32
+    };
+    (to_abs(x), to_abs(y))
+}
+
+#[cfg(test)]
+mod warp_tests {
+    use super::*;
+
+    #[test]
+    fn normalized_coordinates_map_onto_the_fixed_extent() {
+        assert_eq!(absolute_coordinates(0.0, 0.0), (0, 0));
+        assert_eq!(absolute_coordinates(1.0, 1.0), (65535, 65535));
+        assert_eq!(absolute_coordinates(0.5, 0.25), (32768, 16384));
+    }
+
+    #[test]
+    fn out_of_range_and_nonfinite_coordinates_fail_closed() {
+        assert_eq!(absolute_coordinates(-0.5, 2.0), (0, 65535));
+        assert_eq!(absolute_coordinates(f64::NAN, f64::INFINITY), (0, 0));
     }
 }

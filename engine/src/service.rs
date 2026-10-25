@@ -16,9 +16,11 @@ use lan_mouse_ipc::{
 };
 use log;
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     io,
     net::{IpAddr, SocketAddr},
+    rc::Rc,
     sync::{Arc, RwLock},
 };
 use thiserror::Error;
@@ -70,6 +72,10 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// true while this host's pointer is captured by a peer; shared with
+    /// the emulation listen task so an incoming Enter during an active
+    /// outgoing handoff does not trigger a spurious second pointer warp
+    outgoing_capture_active: Rc<Cell<bool>>,
 }
 
 #[derive(Debug)]
@@ -114,7 +120,9 @@ impl Service {
         let capture_backend = config.capture_backend().map(|b| b.into());
         let capture = Capture::new(capture_backend, conn, config.release_bind());
         let emulation_backend = config.emulation_backend().map(|b| b.into());
-        let emulation = Emulation::new(emulation_backend, listener);
+        let outgoing_capture_active = Rc::new(Cell::new(false));
+        let emulation =
+            Emulation::new(emulation_backend, listener, outgoing_capture_active.clone());
 
         // create dns resolver
         let resolver = DnsResolver::new()?;
@@ -137,6 +145,7 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            outgoing_capture_active,
         };
         Ok(service)
     }
@@ -339,7 +348,7 @@ impl Service {
                 self.emulation_status = Status::Enabled;
                 self.notify_frontend(FrontendEvent::EmulationStatus(self.emulation_status));
             }
-            EmulationEvent::ReleaseNotify => self.capture.release(),
+            EmulationEvent::ReleaseNotify(fraction) => self.capture.release(fraction),
             EmulationEvent::Connected { addr, fingerprint } => {
                 self.notify_frontend(FrontendEvent::DeviceConnected { addr, fingerprint });
             }
@@ -349,19 +358,23 @@ impl Service {
     fn handle_capture_event(&mut self, event: ICaptureEvent) {
         match event {
             ICaptureEvent::RemoteControlActive => {
+                self.outgoing_capture_active.set(true);
                 self.notify_frontend(FrontendEvent::RemoteControlActive)
             }
             ICaptureEvent::RemoteControlInactive => {
+                self.outgoing_capture_active.set(false);
                 self.notify_frontend(FrontendEvent::RemoteControlInactive)
             }
             ICaptureEvent::LocalOwnershipTaken => {
+                self.outgoing_capture_active.set(false);
                 self.notify_frontend(FrontendEvent::LocalOwnershipTaken)
             }
-            ICaptureEvent::CaptureBegin(handle) => {
+            ICaptureEvent::CaptureBegin(handle, fraction) => {
                 // we entered the capture zone for an incoming connection
-                // => notify it that its capture should be released
+                // => notify it that its capture should be released,
+                // carrying the crossing point so it can place its pointer
                 if let Some(incoming) = self.incoming_conn_info.get(&handle) {
-                    self.emulation.send_leave_event(incoming.addr);
+                    self.emulation.send_leave_event(incoming.addr, fraction);
                 }
             }
             ICaptureEvent::CaptureDisabled => {

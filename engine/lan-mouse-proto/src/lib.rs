@@ -21,6 +21,9 @@ pub enum ProtocolError {
     /// position type does not exist
     #[error("invalid event id: `{0}`")]
     InvalidPosition(#[from] TryFromPrimitiveError<Position>),
+    /// edge fraction is not finite or outside `0.0..=1.0`
+    #[error("invalid edge fraction: `{0}`")]
+    InvalidFraction(f64),
 }
 
 /// Position of a client
@@ -50,10 +53,14 @@ impl Display for Position {
 pub enum ProtoEvent {
     /// notify a client that the cursor entered its region at the given position
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
-    Enter(Position),
+    /// the optional fraction is the normalized position (`0.0..=1.0`) along the
+    /// entered edge, used to place the pointer at the crossing point
+    Enter(Position, Option<f64>),
     /// notify a client that the cursor left its region
     /// [`ProtoEvent::Ack`] with the same serial is used for synchronization between devices
-    Leave(u32),
+    /// the optional fraction is the normalized position along the edge the
+    /// cursor returns at, used to place the pointer on capture release
+    Leave(u32, Option<f64>),
     /// acknowledge of an [`ProtoEvent::Enter`] or [`ProtoEvent::Leave`] event
     Ack(u32),
     /// Input event
@@ -68,8 +75,8 @@ pub enum ProtoEvent {
 impl Display for ProtoEvent {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProtoEvent::Enter(s) => write!(f, "Enter({s})"),
-            ProtoEvent::Leave(s) => write!(f, "Leave({s})"),
+            ProtoEvent::Enter(s, frac) => write!(f, "Enter({s}, {frac:?})"),
+            ProtoEvent::Leave(s, frac) => write!(f, "Leave({s}, {frac:?})"),
             ProtoEvent::Ack(s) => write!(f, "Ack({s})"),
             ProtoEvent::Input(e) => write!(f, "{e}"),
             ProtoEvent::Ping => write!(f, "ping"),
@@ -117,8 +124,8 @@ impl ProtoEvent {
             },
             ProtoEvent::Ping => EventType::Ping,
             ProtoEvent::Pong(_) => EventType::Pong,
-            ProtoEvent::Enter(_) => EventType::Enter,
-            ProtoEvent::Leave(_) => EventType::Leave,
+            ProtoEvent::Enter(..) => EventType::Enter,
+            ProtoEvent::Leave(..) => EventType::Leave,
             ProtoEvent::Ack(_) => EventType::Ack,
         }
     }
@@ -171,8 +178,14 @@ impl TryFrom<[u8; MAX_EVENT_SIZE]> for ProtoEvent {
             ))),
             EventType::Ping => Ok(Self::Ping),
             EventType::Pong => Ok(Self::Pong(decode_u8(&mut buf)? != 0)),
-            EventType::Enter => Ok(Self::Enter(decode_u8(&mut buf)?.try_into()?)),
-            EventType::Leave => Ok(Self::Leave(decode_u32(&mut buf)?)),
+            EventType::Enter => Ok(Self::Enter(
+                decode_u8(&mut buf)?.try_into()?,
+                decode_fraction(&mut buf)?,
+            )),
+            EventType::Leave => Ok(Self::Leave(
+                decode_u32(&mut buf)?,
+                decode_fraction(&mut buf)?,
+            )),
             EventType::Ack => Ok(Self::Ack(decode_u32(&mut buf)?)),
         }
     }
@@ -235,8 +248,14 @@ impl From<ProtoEvent> for ([u8; MAX_EVENT_SIZE], usize) {
                 },
                 ProtoEvent::Ping => {}
                 ProtoEvent::Pong(alive) => encode_u8(buf, len, alive as u8),
-                ProtoEvent::Enter(pos) => encode_u8(buf, len, pos as u8),
-                ProtoEvent::Leave(serial) => encode_u32(buf, len, serial),
+                ProtoEvent::Enter(pos, fraction) => {
+                    encode_u8(buf, len, pos as u8);
+                    encode_fraction(buf, len, fraction);
+                }
+                ProtoEvent::Leave(serial, fraction) => {
+                    encode_u32(buf, len, serial);
+                    encode_fraction(buf, len, fraction);
+                }
                 ProtoEvent::Ack(serial) => encode_u32(buf, len, serial),
             }
         }
@@ -280,3 +299,155 @@ encode_impl!(u8);
 encode_impl!(u32);
 encode_impl!(i32);
 encode_impl!(f64);
+
+/// encode an optional edge fraction as a presence flag followed by an f64
+/// payload (0.0 when absent) so the wire size stays constant
+fn encode_fraction(buf: &mut &mut [u8], amt: &mut usize, fraction: Option<f64>) {
+    encode_u8(buf, amt, fraction.is_some() as u8);
+    encode_f64(buf, amt, fraction.unwrap_or(0.0));
+}
+
+/// decode an optional edge fraction; a present fraction must be finite and
+/// within `0.0..=1.0`, otherwise the datagram is rejected
+fn decode_fraction(data: &mut &[u8]) -> Result<Option<f64>, ProtocolError> {
+    let present = decode_u8(data)? != 0;
+    let fraction = decode_f64(data)?;
+    if !present {
+        return Ok(None);
+    }
+    if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+        return Err(ProtocolError::InvalidFraction(fraction));
+    }
+    Ok(Some(fraction))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(event: ProtoEvent) -> ProtoEvent {
+        let (buf, len): ([u8; MAX_EVENT_SIZE], usize) = event.into();
+        assert!(len <= MAX_EVENT_SIZE);
+        ProtoEvent::try_from(buf).expect("roundtrip")
+    }
+
+    fn enter_buf(pos: Position, flag: u8, fraction: f64) -> [u8; MAX_EVENT_SIZE] {
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        buf[0] = EventType::Enter as u8;
+        buf[1] = pos as u8;
+        buf[2] = flag;
+        buf[3..11].copy_from_slice(&fraction.to_be_bytes());
+        buf
+    }
+
+    fn leave_buf(serial: u32, flag: u8, fraction: f64) -> [u8; MAX_EVENT_SIZE] {
+        let mut buf = [0u8; MAX_EVENT_SIZE];
+        buf[0] = EventType::Leave as u8;
+        buf[1..5].copy_from_slice(&serial.to_be_bytes());
+        buf[5] = flag;
+        buf[6..14].copy_from_slice(&fraction.to_be_bytes());
+        buf
+    }
+
+    fn expect_fraction(event: ProtoEvent) -> Option<f64> {
+        match event {
+            ProtoEvent::Enter(_, f) => f,
+            ProtoEvent::Leave(_, f) => f,
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_roundtrips_with_and_without_edge_fraction() {
+        for pos in [
+            Position::Left,
+            Position::Right,
+            Position::Top,
+            Position::Bottom,
+        ] {
+            match roundtrip(ProtoEvent::Enter(pos, Some(0.42))) {
+                ProtoEvent::Enter(p, f) => {
+                    assert!(matches!(p, _p if p as u8 == pos as u8));
+                    assert_eq!(f, Some(0.42));
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            match roundtrip(ProtoEvent::Enter(pos, None)) {
+                ProtoEvent::Enter(_, f) => assert_eq!(f, None),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn enter_fraction_boundaries_roundtrip_exactly() {
+        assert_eq!(
+            expect_fraction(roundtrip(ProtoEvent::Enter(Position::Left, Some(0.0)))),
+            Some(0.0)
+        );
+        assert_eq!(
+            expect_fraction(roundtrip(ProtoEvent::Enter(Position::Left, Some(1.0)))),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn leave_roundtrips_serial_and_edge_fraction() {
+        match roundtrip(ProtoEvent::Leave(7, Some(0.5))) {
+            ProtoEvent::Leave(serial, f) => {
+                assert_eq!(serial, 7);
+                assert_eq!(f, Some(0.5));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        match roundtrip(ProtoEvent::Leave(u32::MAX, None)) {
+            ProtoEvent::Leave(serial, f) => {
+                assert_eq!(serial, u32::MAX);
+                assert_eq!(f, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ack_roundtrip_unchanged() {
+        match roundtrip(ProtoEvent::Ack(123)) {
+            ProtoEvent::Ack(serial) => assert_eq!(serial, 123),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nonfinite_and_out_of_range_enter_fractions_are_rejected() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.001, 1.001] {
+            assert!(
+                matches!(
+                    ProtoEvent::try_from(enter_buf(Position::Left, 1, bad)),
+                    Err(ProtocolError::InvalidFraction(_))
+                ),
+                "fraction {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn nonfinite_and_out_of_range_leave_fractions_are_rejected() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.5, 2.0] {
+            assert!(
+                matches!(
+                    ProtoEvent::try_from(leave_buf(0, 1, bad)),
+                    Err(ProtocolError::InvalidFraction(_))
+                ),
+                "fraction {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn absent_fraction_flag_ignores_payload_bytes() {
+        match ProtoEvent::try_from(enter_buf(Position::Right, 0, 0.75)).expect("valid") {
+            ProtoEvent::Enter(_, f) => assert_eq!(f, None),
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+}

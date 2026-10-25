@@ -37,8 +37,10 @@ pub type CaptureHandle = u64;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum CaptureEvent {
-    /// capture on this capture handle is now active
-    Begin,
+    /// capture on this capture handle is now active;
+    /// carries the normalized fraction (`0.0..=1.0`) along the crossed
+    /// screen edge when the backend knows the crossing point
+    Begin(Option<f64>),
     /// input event coming from capture handle
     Input(Event),
 }
@@ -46,7 +48,7 @@ pub enum CaptureEvent {
 impl Display for CaptureEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            CaptureEvent::Begin => write!(f, "begin capture"),
+            CaptureEvent::Begin(frac) => write!(f, "begin capture ({frac:?})"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
         }
     }
@@ -167,8 +169,14 @@ impl InputCapture {
 
     /// release mouse
     pub async fn release(&mut self) -> Result<(), CaptureError> {
+        self.release_at(None).await
+    }
+
+    /// release mouse, optionally placing the pointer at the normalized
+    /// fraction along the crossed edge (geometric return)
+    pub async fn release_at(&mut self, fraction: Option<f64>) -> Result<(), CaptureError> {
         self.pressed_keys.clear();
-        self.capture.release().await
+        self.capture.release_at(fraction).await
     }
 
     /// Drain and return every key the capture has forwarded as
@@ -276,7 +284,10 @@ impl Stream for InputCapture {
     }
 }
 
-#[async_trait]
+/* `?Send`: the `release_at` default delegates to `release`, which would
+ * otherwise require `Self: Send` for the boxed future; all capture
+ * backends are driven from a single-threaded `LocalSet` anyway. */
+#[async_trait(?Send)]
 trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + Unpin {
     /// create a new client with the given id
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError>;
@@ -286,6 +297,13 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
 
     /// release mouse
     async fn release(&mut self) -> Result<(), CaptureError>;
+
+    /// release mouse at a normalized edge fraction; backends without
+    /// pointer placement fall back to a plain release
+    async fn release_at(&mut self, fraction: Option<f64>) -> Result<(), CaptureError> {
+        let _ = fraction;
+        self.release().await
+    }
 
     /// destroy the input capture
     async fn terminate(&mut self) -> Result<(), CaptureError>;
@@ -348,4 +366,116 @@ async fn create(
         }
     }
     Err(CaptureCreationError::NoAvailableBackend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
+
+    #[derive(Default)]
+    struct ReleaseLog {
+        release: usize,
+        release_at: Vec<Option<f64>>,
+    }
+
+    /// backend without a geometric release: must fall back to `release()`
+    struct PlainStub(Arc<Mutex<ReleaseLog>>);
+
+    /// backend that records geometric releases
+    struct WarpStub(Arc<Mutex<ReleaseLog>>);
+
+    macro_rules! stub_boilerplate {
+        ($t:ty) => {
+            impl Stream for $t {
+                type Item = Result<(Position, CaptureEvent), CaptureError>;
+                fn poll_next(
+                    self: std::pin::Pin<&mut Self>,
+                    _cx: &mut Context<'_>,
+                ) -> Poll<Option<Self::Item>> {
+                    Poll::Pending
+                }
+            }
+        };
+    }
+
+    stub_boilerplate!(PlainStub);
+    stub_boilerplate!(WarpStub);
+
+    #[async_trait(?Send)]
+    impl Capture for PlainStub {
+        async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn destroy(&mut self, _pos: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn release(&mut self) -> Result<(), CaptureError> {
+            self.0.lock().unwrap().release += 1;
+            Ok(())
+        }
+        async fn terminate(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl Capture for WarpStub {
+        async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn destroy(&mut self, _pos: Position) -> Result<(), CaptureError> {
+            Ok(())
+        }
+        async fn release(&mut self) -> Result<(), CaptureError> {
+            self.0.lock().unwrap().release += 1;
+            Ok(())
+        }
+        async fn release_at(&mut self, fraction: Option<f64>) -> Result<(), CaptureError> {
+            self.0.lock().unwrap().release_at.push(fraction);
+            Ok(())
+        }
+        async fn terminate(&mut self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    fn capture_with(
+        backend: Box<dyn Capture<Item = Result<(Position, CaptureEvent), CaptureError>>>,
+    ) -> InputCapture {
+        InputCapture {
+            capture: backend,
+            pressed_keys: HashSet::new(),
+            position_map: HashMap::new(),
+            id_map: HashMap::new(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_at_defaults_to_plain_release() {
+        let log = Arc::new(Mutex::new(ReleaseLog::default()));
+        let mut capture = capture_with(Box::new(PlainStub(log.clone())));
+        capture.release_at(Some(0.5)).await.expect("release");
+        assert_eq!(log.lock().unwrap().release, 1);
+        assert!(log.lock().unwrap().release_at.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn release_at_forwards_fraction_to_geometric_backend() {
+        let log = Arc::new(Mutex::new(ReleaseLog::default()));
+        let mut capture = capture_with(Box::new(WarpStub(log.clone())));
+        capture.release_at(Some(0.25)).await.expect("release");
+        assert_eq!(log.lock().unwrap().release, 0);
+        assert_eq!(log.lock().unwrap().release_at, vec![Some(0.25)]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn plain_release_is_a_non_geometric_release() {
+        let log = Arc::new(Mutex::new(ReleaseLog::default()));
+        let mut capture = capture_with(Box::new(WarpStub(log.clone())));
+        capture.release().await.expect("release");
+        assert_eq!(log.lock().unwrap().release_at, vec![None]);
+    }
 }

@@ -30,8 +30,9 @@ pub(crate) enum ICaptureEvent {
     RemoteControlInactive,
     /// A physical input request released an outgoing handoff.
     LocalOwnershipTaken,
-    /// a client was entered
-    CaptureBegin(CaptureHandle),
+    /// a client was entered; carries the normalized fraction along the
+    /// crossed edge when the capture backend knows the crossing point
+    CaptureBegin(CaptureHandle, Option<f64>),
     /// capture disabled
     CaptureDisabled,
     /// capture disabled
@@ -58,8 +59,9 @@ pub(crate) enum CaptureType {
 #[derive(Clone, Debug)]
 enum CaptureRequest {
     TakeLocalOwnership,
-    /// capture must release the mouse
-    Release,
+    /// capture must release the mouse; a fraction requests a geometric
+    /// release placing the pointer along the crossed edge
+    Release(Option<f64>),
     /// add a capture client
     Create(CaptureHandle, Position, CaptureType),
     /// destory a capture client
@@ -85,6 +87,7 @@ impl Capture {
             cancellation_token: cancellation_token.clone(),
             captures: Default::default(),
             conn,
+            enter_fraction: None,
             event_tx,
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
@@ -131,9 +134,9 @@ impl Capture {
             .expect("channel closed");
     }
 
-    pub(crate) fn release(&self) {
+    pub(crate) fn release(&self, fraction: Option<f64>) {
         self.request_tx
-            .send(CaptureRequest::Release)
+            .send(CaptureRequest::Release(fraction))
             .expect("channel closed");
     }
 
@@ -175,6 +178,10 @@ struct CaptureTask {
     cancellation_token: CancellationToken,
     captures: Vec<(CaptureHandle, Position, CaptureType)>,
     conn: LanMouseConnection,
+    /// edge fraction of the current (unacknowledged) handoff, kept so
+    /// repeated `Enter` events while [`State::WaitingForAck`] carry the
+    /// same crossing point as the initial one
+    enter_fraction: Option<f64>,
     event_tx: Sender<ICaptureEvent>,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
@@ -223,7 +230,7 @@ impl CaptureTask {
                         CaptureRequest::Reenable => break,
                         CaptureRequest::Create(h, p, t) => self.add_capture(h, p, t),
                         CaptureRequest::Destroy(h) => self.remove_capture(h),
-                        CaptureRequest::Release | CaptureRequest::TakeLocalOwnership => { /* nothing to do */ }
+                        CaptureRequest::Release(..) | CaptureRequest::TakeLocalOwnership => { /* nothing to do */ }
                         CaptureRequest::SetReleaseBind(bind) => {
                             self.release_bind.borrow_mut().clone_from(&bind);
                         }
@@ -298,25 +305,22 @@ impl CaptureTask {
                             self.event_tx.send(ICaptureEvent::RemoteControlActive).expect("channel closed");
                         }
                         // client disconnected
-                        ProtoEvent::Leave(_) => {
+                        ProtoEvent::Leave(_, fraction) => {
                             log::info!("releasing capture: left remote client device region");
-                            self.release_capture(capture).await?;
+                            self.release_capture(capture, fraction).await?;
                         },
                         _ => {}
                     }
                 },
                 e = self.request_rx.recv() => match e.expect("channel closed") {
                     CaptureRequest::Reenable => { /* already active */ },
-                    CaptureRequest::Release => self.release_capture(capture).await?,
+                    CaptureRequest::Release(fraction) => self.release_capture(capture, fraction).await?,
                     CaptureRequest::TakeLocalOwnership => self.take_local_ownership(capture).await?,
                     CaptureRequest::Create(h, p, t) => {
                         self.add_capture(h, p, t);
                         capture.create(h, p).await?;
                     }
-                    CaptureRequest::Destroy(h) => {
-                        self.remove_capture(h);
-                        capture.destroy(h).await?;
-                    }
+                    CaptureRequest::Destroy(h) => self.destroy_capture(capture, h).await?,
                     CaptureRequest::SetReleaseBind(bind) => {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
@@ -335,14 +339,27 @@ impl CaptureTask {
         let (handle, event) = event;
         log::trace!("({handle}): {event:?}");
 
-        if capture.keys_pressed(&self.release_bind.borrow()) {
-            log::info!("releasing capture: release-bind pressed");
-            return self.release_capture(capture).await;
+        /* `InputCapture` fans an event out to every handle sharing a
+         * position and queues the extra copies; a `Destroy` processed in
+         * the meantime cannot purge that queue, so events for an already
+         * retired handle (e.g. an EnterOnly trigger replaced during a
+         * rapid re-handoff) can still be delivered here. Drop them:
+         * the capture is gone, and the active capture of an unrelated
+         * handle must not be released. */
+        if !self.captures.iter().any(|&(h, ..)| h == handle) {
+            log::debug!("ignoring event for retired capture handle {handle}: {event:?}");
+            return Ok(());
         }
 
-        if event == CaptureEvent::Begin {
+        if capture.keys_pressed(&self.release_bind.borrow()) {
+            log::info!("releasing capture: release-bind pressed");
+            // non-geometric release: the release bind has no edge context
+            return self.release_capture(capture, None).await;
+        }
+
+        if let CaptureEvent::Begin(fraction) = event {
             self.event_tx
-                .send(ICaptureEvent::CaptureBegin(handle))
+                .send(ICaptureEvent::CaptureBegin(handle, fraction))
                 .expect("channel closed");
         }
 
@@ -359,24 +376,19 @@ impl CaptureTask {
         }
 
         // activated a new client
-        if event == CaptureEvent::Begin && Some(handle) != self.active_client {
-            self.state = State::WaitingForAck;
-            self.active_client.replace(handle);
-            self.event_tx
-                .send(ICaptureEvent::ClientEntered(handle))
-                .expect("channel closed");
+        if let CaptureEvent::Begin(fraction) = event {
+            if Some(handle) != self.active_client {
+                self.state = State::WaitingForAck;
+                self.enter_fraction = fraction;
+                self.active_client.replace(handle);
+                self.event_tx
+                    .send(ICaptureEvent::ClientEntered(handle))
+                    .expect("channel closed");
+            }
         }
 
-        let opposite_pos = to_proto_pos(self.get_pos(handle).opposite());
-
-        let event = match event {
-            CaptureEvent::Begin => ProtoEvent::Enter(opposite_pos),
-            CaptureEvent::Input(e) => match self.state {
-                // connection not acknowledged, repeat `Enter` event
-                State::WaitingForAck => ProtoEvent::Enter(opposite_pos),
-                State::Sending => ProtoEvent::Input(e),
-            },
-        };
+        let event =
+            outgoing_proto_event(self.state, self.get_pos(handle), event, self.enter_fraction);
 
         if let Err(e) = self.conn.send(event, handle).await {
             const DUR: Duration = Duration::from_millis(500);
@@ -386,7 +398,29 @@ impl CaptureTask {
         Ok(())
     }
 
-    async fn release_capture(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+    async fn destroy_capture(
+        &mut self,
+        capture: &mut InputCapture,
+        handle: CaptureHandle,
+    ) -> Result<(), CaptureError> {
+        /* If the destroyed handle currently owns the capture, end the
+         * handoff properly (key-ups + Leave to the peer, local release);
+         * an unrelated active capture must not be released. */
+        if self.active_client == Some(handle) {
+            // non-geometric release: the client is gone, there is no edge to return at
+            self.release_capture(capture, None).await?;
+        }
+        self.remove_capture(handle);
+        capture.destroy(handle).await?;
+        Ok(())
+    }
+
+    async fn release_capture(
+        &mut self,
+        capture: &mut InputCapture,
+        fraction: Option<f64>,
+    ) -> Result<(), CaptureError> {
+        self.enter_fraction = None;
         // If we have an active client, notify them we're leaving
         if let Some(handle) = self.active_client.take() {
             // Synthesize key-up events for every key still held in the
@@ -425,11 +459,11 @@ impl CaptureTask {
             }
 
             log::info!("sending Leave event to client {handle}");
-            if let Err(e) = self.conn.send(ProtoEvent::Leave(0), handle).await {
+            if let Err(e) = self.conn.send(ProtoEvent::Leave(0, fraction), handle).await {
                 log::warn!("failed to send Leave to client {handle}: {e}");
             }
         }
-        let result = capture.release().await;
+        let result = capture.release_at(fraction).await;
         self.event_tx
             .send(ICaptureEvent::RemoteControlInactive)
             .expect("channel closed");
@@ -443,7 +477,8 @@ impl CaptureTask {
         // Local motion now explicitly returns this host even when it is the
         // sender. Idle local activity must not keep warping the pointer.
         if self.active_client.is_some() {
-            self.release_capture(capture).await?;
+            // non-geometric release: local takeover has no edge context
+            self.release_capture(capture, None).await?;
             log::info!("Glide: physical input returns outgoing control to this host");
             self.event_tx
                 .send(ICaptureEvent::LocalOwnershipTaken)
@@ -457,6 +492,25 @@ fn reply_is_current(active: Option<CaptureHandle>, handle: CaptureHandle) -> boo
     active == Some(handle)
 }
 
+/// protocol event to send for a capture event; an unacknowledged handoff
+/// repeats the `Enter` (with the fraction of the initial crossing) until
+/// the peer acknowledges it
+fn outgoing_proto_event(
+    state: State,
+    pos: Position,
+    event: CaptureEvent,
+    enter_fraction: Option<f64>,
+) -> ProtoEvent {
+    let opposite_pos = to_proto_pos(pos.opposite());
+    match event {
+        CaptureEvent::Begin(fraction) => ProtoEvent::Enter(opposite_pos, fraction),
+        CaptureEvent::Input(e) => match state {
+            State::WaitingForAck => ProtoEvent::Enter(opposite_pos, enter_fraction),
+            State::Sending => ProtoEvent::Input(e),
+        },
+    }
+}
+
 #[cfg(test)]
 mod handoff_tests {
     use super::reply_is_current;
@@ -466,6 +520,240 @@ mod handoff_tests {
         assert!(!reply_is_current(None, 0));
         assert!(!reply_is_current(Some(1), 0));
         assert!(reply_is_current(Some(0), 0));
+    }
+}
+
+#[cfg(test)]
+mod fraction_tests {
+    use super::*;
+    use input_event::{Event, PointerEvent};
+
+    fn motion() -> Event {
+        Event::Pointer(PointerEvent::Motion {
+            time: 0,
+            dx: 1.0,
+            dy: 1.0,
+        })
+    }
+
+    fn expect_enter(event: ProtoEvent) -> (lan_mouse_proto::Position, Option<f64>) {
+        match event {
+            ProtoEvent::Enter(pos, fraction) => (pos, fraction),
+            other => panic!("expected Enter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn begin_sends_enter_with_the_crossing_fraction() {
+        let (pos, fraction) = expect_enter(outgoing_proto_event(
+            State::WaitingForAck,
+            Position::Right,
+            CaptureEvent::Begin(Some(0.25)),
+            None,
+        ));
+        assert!(matches!(pos, lan_mouse_proto::Position::Left)); // opposite side
+        assert_eq!(fraction, Some(0.25));
+    }
+
+    #[test]
+    fn begin_without_geometry_sends_enter_without_fraction() {
+        let (_, fraction) = expect_enter(outgoing_proto_event(
+            State::WaitingForAck,
+            Position::Right,
+            CaptureEvent::Begin(None),
+            None,
+        ));
+        assert_eq!(fraction, None);
+    }
+
+    #[test]
+    fn enter_retries_while_waiting_for_ack_keep_the_initial_fraction() {
+        let (_, fraction) = expect_enter(outgoing_proto_event(
+            State::WaitingForAck,
+            Position::Right,
+            CaptureEvent::Input(motion()),
+            Some(0.75),
+        ));
+        assert_eq!(fraction, Some(0.75));
+    }
+
+    #[test]
+    fn acknowledged_capture_forwards_input_events() {
+        match outgoing_proto_event(
+            State::Sending,
+            Position::Right,
+            CaptureEvent::Input(motion()),
+            Some(0.75),
+        ) {
+            ProtoEvent::Input(e) => assert_eq!(e, motion()),
+            other => panic!("expected Input, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod stale_capture_tests {
+    use super::*;
+    use crate::client::ClientManager;
+    use input_capture::Backend;
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::task::LocalSet;
+    use webrtc_dtls::crypto::Certificate;
+
+    const DEFAULT_HANDLE: CaptureHandle = 0;
+    /// EnterOnly trigger handle for an incoming connection (cf. service.rs
+    /// ENTER_HANDLE_BEGIN).
+    const ENTER_HANDLE: CaptureHandle = u64::MAX / 2 + 1;
+
+    fn test_task() -> (CaptureTask, Receiver<ICaptureEvent>) {
+        let (_request_tx, request_rx) = channel();
+        let (event_tx, event_rx) = channel();
+        let cert = Certificate::generate_self_signed(["ignored".to_owned()]).expect("cert");
+        let conn = LanMouseConnection::new(
+            cert,
+            ClientManager::default(),
+            HashMap::new(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let task = CaptureTask {
+            active_client: None,
+            backend: None,
+            cancellation_token: CancellationToken::new(),
+            captures: vec![],
+            conn,
+            enter_fraction: None,
+            event_tx,
+            request_rx,
+            release_bind: Rc::new(RefCell::new(vec![scancode::Linux::KeyLeftCtrl])),
+            state: Default::default(),
+        };
+        (task, event_rx)
+    }
+
+    async fn dummy_capture() -> InputCapture {
+        InputCapture::new(Some(Backend::Dummy))
+            .await
+            .expect("dummy capture backend")
+    }
+
+    /// The dummy backend emits `Begin` for `Position::Left`; with both a
+    /// Default client and an EnterOnly trigger registered at that position,
+    /// `InputCapture` fans the event out and queues the second copy in its
+    /// `pending` queue. Destroying the trigger handle cannot purge that
+    /// queue, so the retired handle's event is delivered afterwards.
+    async fn setup_with_queued_stale_begin(
+        task: &mut CaptureTask,
+        capture: &mut InputCapture,
+    ) -> (CaptureHandle, CaptureEvent) {
+        task.add_capture(DEFAULT_HANDLE, Position::Left, CaptureType::Default);
+        task.add_capture(ENTER_HANDLE, Position::Left, CaptureType::EnterOnly);
+        capture
+            .create(DEFAULT_HANDLE, Position::Left)
+            .await
+            .expect("create default");
+        capture
+            .create(ENTER_HANDLE, Position::Left)
+            .await
+            .expect("create enter-only");
+
+        let first = capture.next().await.expect("stream open").expect("event");
+        assert_eq!(first, (DEFAULT_HANDLE, CaptureEvent::Begin(None)));
+        task.handle_capture_event(capture, first)
+            .await
+            .expect("begin event");
+        assert_eq!(task.active_client, Some(DEFAULT_HANDLE));
+
+        /* retire the trigger handle while its Begin is still queued */
+        task.remove_capture(ENTER_HANDLE);
+        capture.destroy(ENTER_HANDLE).await.expect("destroy");
+
+        let stale = capture.next().await.expect("stream open").expect("event");
+        assert_eq!(stale, (ENTER_HANDLE, CaptureEvent::Begin(None)));
+        stale
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_event_for_retired_handle_is_ignored() {
+        LocalSet::new()
+            .run_until(async {
+                let (mut task, _event_rx) = test_task();
+                let mut capture = dummy_capture().await;
+                let stale = setup_with_queued_stale_begin(&mut task, &mut capture).await;
+
+                /* must not panic and must not release the unrelated,
+                 * still-registered active capture */
+                task.handle_capture_event(&mut capture, stale)
+                    .await
+                    .expect("stale event must be ignored");
+                assert_eq!(task.active_client, Some(DEFAULT_HANDLE));
+            })
+            .await;
+    }
+
+    use futures::FutureExt;
+
+    fn drain_events(event_rx: &mut Receiver<ICaptureEvent>) -> Vec<ICaptureEvent> {
+        let mut events = vec![];
+        while let Some(Some(event)) = event_rx.recv().now_or_never() {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn destroying_inactive_handle_keeps_active_capture() {
+        LocalSet::new()
+            .run_until(async {
+                let (mut task, mut event_rx) = test_task();
+                let mut capture = dummy_capture().await;
+                let _ = setup_with_queued_stale_begin(&mut task, &mut capture).await;
+
+                /* re-register the trigger handle so it can be destroyed */
+                task.add_capture(ENTER_HANDLE, Position::Left, CaptureType::EnterOnly);
+                capture
+                    .create(ENTER_HANDLE, Position::Left)
+                    .await
+                    .expect("re-create enter-only");
+
+                task.destroy_capture(&mut capture, ENTER_HANDLE)
+                    .await
+                    .expect("destroy inactive handle");
+
+                assert_eq!(task.active_client, Some(DEFAULT_HANDLE));
+                let events = drain_events(&mut event_rx);
+                assert!(
+                    !events
+                        .iter()
+                        .any(|e| matches!(e, ICaptureEvent::RemoteControlInactive)),
+                    "destroying an inactive handle must not release the active capture"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn destroying_active_handle_releases_capture_state() {
+        LocalSet::new()
+            .run_until(async {
+                let (mut task, mut event_rx) = test_task();
+                let mut capture = dummy_capture().await;
+                let _ = setup_with_queued_stale_begin(&mut task, &mut capture).await;
+
+                task.destroy_capture(&mut capture, DEFAULT_HANDLE)
+                    .await
+                    .expect("destroy active handle");
+
+                assert_eq!(task.active_client, None);
+                let events = drain_events(&mut event_rx);
+                assert!(
+                    events
+                        .iter()
+                        .any(|e| matches!(e, ICaptureEvent::RemoteControlInactive)),
+                    "destroying the active handle must release the capture"
+                );
+            })
+            .await;
     }
 }
 
