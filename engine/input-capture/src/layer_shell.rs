@@ -29,6 +29,10 @@ use wayland_protocols::{
             zwp_locked_pointer_v1::ZwpLockedPointerV1,
             zwp_pointer_constraints_v1::{Lifetime, ZwpPointerConstraintsV1},
         },
+        pointer_gestures::zv1::client::{
+            zwp_pointer_gesture_swipe_v1::{self, ZwpPointerGestureSwipeV1},
+            zwp_pointer_gestures_v1::ZwpPointerGesturesV1,
+        },
         pointer_warp::v1::client::wp_pointer_warp_v1::WpPointerWarpV1,
         relative_pointer::zv1::client::{
             zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
@@ -65,7 +69,7 @@ use wayland_client::{
 
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
-use crate::{CaptureError, CaptureEvent};
+use crate::{CaptureError, CaptureEvent, gesture};
 
 use super::{
     Capture, Position,
@@ -75,6 +79,7 @@ use super::{
 struct Globals {
     compositor: wl_compositor::WlCompositor,
     pointer_constraints: ZwpPointerConstraintsV1,
+    pointer_gestures: Option<ZwpPointerGesturesV1>,
     relative_pointer_manager: ZwpRelativePointerManagerV1,
     shortcut_inhibit_manager: Option<ZwpKeyboardShortcutsInhibitManagerV1>,
     pointer_warp: Option<WpPointerWarpV1>,
@@ -123,6 +128,7 @@ struct State {
     pointer_lock: Option<ZwpLockedPointerV1>,
     rel_pointer: Option<ZwpRelativePointerV1>,
     shortcut_inhibitor: Option<ZwpKeyboardShortcutsInhibitorV1>,
+    swipe_gesture: Option<ZwpPointerGestureSwipeV1>,
     active_windows: Vec<Arc<Window>>,
     focused: Option<Arc<Window>>,
     global_list: GlobalList,
@@ -132,7 +138,13 @@ struct State {
     qh: QueueHandle<Self>,
     pending_events: VecDeque<(Position, CaptureEvent)>,
     outputs: Vec<Output>,
-    scroll_discrete_pending: bool,
+    scroll_frame: gesture::ScrollFrame,
+    two_finger: gesture::TwoFingerScroll,
+    swipe: gesture::ThreeFingerSwipe,
+    /// depressed modifier mask from the latest wl_keyboard modifiers
+    /// event; gates synthesized workspace chords so user-held modifiers
+    /// are never corrupted
+    mods_depressed: u32,
     last_ungrab: Option<Instant>,
     /// serial of the pointer enter that started the current grab, required
     /// for set_cursor / pointer warp requests before the grab is released
@@ -323,6 +335,19 @@ impl LayerShellInputCapture {
         }
         let shortcut_inhibit_manager = shortcut_inhibit_manager.ok();
 
+        // optional pointer gestures protocol: delivers three-finger swipe
+        // begin/update/end while the barrier surface holds pointer focus
+        let pointer_gestures: Result<ZwpPointerGesturesV1, WaylandBindError> = global_list
+            .bind(&qh, 1..=3, ())
+            .map_err(|e| WaylandBindError::new(e, "zwp_pointer_gestures_v1"));
+        if let Err(e) = &pointer_gestures {
+            log::warn!(
+                "pointer_gestures not supported: {e}\n\
+                three-finger workspace swipes will not be recognized"
+            );
+        }
+        let pointer_gestures = pointer_gestures.ok();
+
         // optional pointer warp protocol: lets us place the cursor exactly
         // when releasing a captured pointer back to this host
         let pointer_warp: Result<WpPointerWarpV1, WaylandBindError> = global_list
@@ -347,6 +372,7 @@ impl LayerShellInputCapture {
                 layer_shell,
                 seat,
                 pointer_constraints,
+                pointer_gestures,
                 relative_pointer_manager,
                 shortcut_inhibit_manager,
                 pointer_warp,
@@ -355,6 +381,7 @@ impl LayerShellInputCapture {
             pointer_lock: None,
             rel_pointer: None,
             shortcut_inhibitor: None,
+            swipe_gesture: None,
             active_windows: Vec::new(),
             focused: None,
             qh,
@@ -362,7 +389,10 @@ impl LayerShellInputCapture {
             read_guard: None,
             pending_events: VecDeque::new(),
             outputs: vec![],
-            scroll_discrete_pending: false,
+            scroll_frame: gesture::ScrollFrame::default(),
+            two_finger: gesture::TwoFingerScroll::default(),
+            swipe: gesture::ThreeFingerSwipe::default(),
+            mods_depressed: 0,
             last_ungrab: None,
             enter_serial: None,
         };
@@ -402,6 +432,9 @@ impl LayerShellInputCapture {
             inner.state.active_windows.remove(i);
             inner.state.focused = None;
         }
+        // focus is gone: cancel in-flight gesture candidates
+        inner.state.two_finger.reset();
+        inner.state.swipe.reset();
     }
 }
 
@@ -508,6 +541,11 @@ impl State {
     }
 
     fn ungrab(&mut self) {
+        // ownership is gone: cancel in-flight gesture candidates so no
+        // delayed action can fire after the grab has been released
+        self.two_finger.reset();
+        self.swipe.reset();
+        self.scroll_frame = gesture::ScrollFrame::default();
         if self.pointer_lock.is_none()
             && self.rel_pointer.is_none()
             && self.shortcut_inhibitor.is_none()
@@ -793,11 +831,24 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
         } = event
         {
             if capabilities.contains(wl_seat::Capability::Pointer) {
+                if let Some(swipe_gesture) = state.swipe_gesture.take() {
+                    swipe_gesture.destroy();
+                }
                 if let Some(p) = state.pointer.take() {
                     p.release();
                 }
-                state.pointer.replace(seat.get_pointer(qh, ()));
+                let pointer = seat.get_pointer(qh, ());
+                state.swipe_gesture = state
+                    .globals
+                    .pointer_gestures
+                    .as_ref()
+                    .map(|gestures| gestures.get_swipe_gesture(&pointer, qh, ()));
+                state.pointer.replace(pointer);
             }
+            // device (re)arrival/removal cancels any in-flight gesture
+            // candidate so no action fires for a device that is gone
+            state.two_finger.reset();
+            state.swipe.reset();
             if capabilities.contains(wl_seat::Capability::Keyboard) {
                 if let Some(k) = state.keyboard.take() {
                     k.release();
@@ -882,38 +933,37 @@ impl Dispatch<WlPointer, ()> for State {
                 ));
             }
             wl_pointer::Event::Axis { time, axis, value } => {
-                let window = app.focused.as_ref().unwrap();
-                if app.scroll_discrete_pending {
-                    // each axisvalue120 event is coupled with
-                    // a corresponding axis event, which needs to
-                    // be ignored to not duplicate the scrolling
-                    app.scroll_discrete_pending = false;
-                } else {
-                    app.pending_events.push_back((
-                        window.pos,
-                        CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
-                            time,
-                            axis: u32::from(axis) as u8,
-                            value,
-                        })),
-                    ));
-                }
+                app.scroll_frame.axes.push(PointerEvent::Axis {
+                    time,
+                    axis: u32::from(axis) as u8,
+                    value,
+                });
+            }
+            wl_pointer::Event::AxisSource { axis_source } => {
+                app.scroll_frame.finger_source =
+                    matches!(axis_source, WEnum::Value(wl_pointer::AxisSource::Finger));
+            }
+            wl_pointer::Event::AxisStop { time, axis } => {
+                app.scroll_frame.stops.push((time, u32::from(axis) as u8));
             }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
-                let window = app.focused.as_ref().unwrap();
-                app.scroll_discrete_pending = true;
-                app.pending_events.push_back((
-                    window.pos,
-                    CaptureEvent::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
-                        axis: u32::from(axis) as u8,
-                        value: value120,
-                    })),
-                ));
+                app.scroll_frame.axes.push(PointerEvent::AxisDiscrete120 {
+                    axis: u32::from(axis) as u8,
+                    value: value120,
+                });
             }
             wl_pointer::Event::Frame => {
-                // TODO properly handle frame events
-                // we simply insert a frame event on the client side
-                // after each event for now
+                // AxisSource and wheel metadata may arrive after Axis.
+                // Interpret the complete frame, never its delivery order.
+                let grabbed = app.pointer_lock.is_some() && app.focused.is_some();
+                let events = app.scroll_frame.finish(&mut app.two_finger, grabbed);
+                if let Some(window) = &app.focused {
+                    app.pending_events.extend(
+                        events
+                            .into_iter()
+                            .map(|event| (window.pos, CaptureEvent::Input(event))),
+                    );
+                }
             }
             _ => {}
         }
@@ -1086,6 +1136,10 @@ impl Dispatch<WlKeyboard, ()> for State {
                 mods_locked,
                 group,
             } => {
+                // track physically held modifiers so synthesized
+                // workspace chords can be suppressed while any modifier
+                // is held (never clear or release user-held modifiers)
+                app.mods_depressed = mods_depressed;
                 if let Some(window) = window {
                     app.pending_events.push_back((
                         window.pos,
@@ -1117,6 +1171,50 @@ impl Dispatch<ZwpRelativePointerV1, ()> for State {
                 app.pending_events
                     .push_back((window.pos, CaptureEvent::Input(Event::Pointer(motion))));
             }
+        }
+    }
+}
+
+impl Dispatch<ZwpPointerGestureSwipeV1, ()> for State {
+    fn event(
+        app: &mut Self,
+        _: &ZwpPointerGestureSwipeV1,
+        event: zwp_pointer_gesture_swipe_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // `focused` can outlive an explicit ungrab until the compositor's
+        // Leave arrives. It is not proof that Glide still owns input.
+        if app.pointer_lock.is_none() || app.focused.is_none() {
+            app.swipe.reset();
+            return;
+        }
+        match event {
+            zwp_pointer_gesture_swipe_v1::Event::Begin { fingers, .. } => {
+                app.swipe.begin(fingers);
+            }
+            zwp_pointer_gesture_swipe_v1::Event::Update { dx, dy, .. } => {
+                app.swipe.update(dx, dy);
+            }
+            zwp_pointer_gesture_swipe_v1::Event::End {
+                time, cancelled, ..
+            } => {
+                let modifiers_held = app.mods_depressed != 0;
+                let events = app.swipe.end(time, cancelled != 0, modifiers_held);
+                if events.is_empty() {
+                    return;
+                }
+                // never emit a gesture action after ownership is gone
+                let Some(pos) = app.focused.as_ref().map(|w| w.pos) else {
+                    return;
+                };
+                for event in events {
+                    app.pending_events
+                        .push_back((pos, CaptureEvent::Input(event)));
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1288,6 +1386,7 @@ delegate_noop!(State: ZwlrLayerShellV1);
 delegate_noop!(State: ZwpRelativePointerManagerV1);
 delegate_noop!(State: ZwpKeyboardShortcutsInhibitManagerV1);
 delegate_noop!(State: ZwpPointerConstraintsV1);
+delegate_noop!(State: ZwpPointerGesturesV1);
 delegate_noop!(State: WpPointerWarpV1);
 
 // ignore events

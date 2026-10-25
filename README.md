@@ -73,6 +73,25 @@ If you release control while resting on a screen edge, move inward before crossi
 
 **Coordinate-aware crossing:** the engine carries the crossing point along an edge (a normalized fraction) through the handoff in both directions. When a peer's pointer enters this machine, the pointer is placed at the entered edge at that fraction before subsequent input arrives; when control returns to this machine, the capture side warps the pointer just inside the same relative edge position via the compositor's `wp_pointer_warp_v1` protocol, instead of resurrecting it wherever it was parked while hidden. Emergency release, disconnects, and physical takeover never warp. Both machines must run the rebuilt engine together — the wire format changed with no compatibility fallback for older builds. Edge coordinate crossing has been verified in prior work with both peers on the same build; if a compositor does not advertise pointer warping, the engine logs a warning at startup and returns behave as before.
 
+## Trackpad gestures (experimental)
+
+While Glide captures input for another machine, its layer-shell backend recognizes these completed horizontal gestures:
+
+| Gesture | Remote action |
+| --- | --- |
+| Two fingers, left to right | Back mouse button |
+| Two fingers, right to left | Forward mouse button |
+| Three fingers, left to right | Previous workspace (`Super+Shift+Tab`) |
+| Three fingers, right to left | Next workspace (`Super+Tab`) |
+
+Two-finger directions assume **natural scrolling is enabled on the sending trackpad**. Workspace actions use the receiving machine's Omarchy shortcuts. They switch after the gesture ends, without finger-following animation. A held modifier suppresses workspace actions.
+
+Navigation requires at least 80 scroll units and horizontal motion at least twice the vertical motion. Smaller horizontal movements are buffered until the fingers lift, then forwarded as scrolling. Vertical scrolling is immediate. Mouse-wheel scrolling is not classified as a gesture. A long, predominantly horizontal finger scroll counts as navigation: this is a threshold heuristic, not application-aware intent detection.
+
+Three-finger workspace swipes require 200 units of horizontal displacement and the same 2:1 dominance. Cancelled gestures and pending gestures at capture release produce no action. The compositor must provide pointer gestures and honor Glide's shortcut inhibitor to prevent simultaneous local workspace changes. Apps must support mouse Back/Forward buttons for navigation to work.
+
+Automated tests cover recognition, cancellation, balanced input sequences, and scroll fallback. Physical gesture directions and application behavior still require a live trackpad check.
+
 ## Troubleshooting
 
 **Release a trapped pointer:** press Left Ctrl + Left Shift + Esc on the sending keyboard. To pause sharing from a terminal on either computer:

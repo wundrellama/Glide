@@ -22,6 +22,9 @@ mod libei;
 mod macos;
 
 #[cfg(layer_shell)]
+mod gesture;
+
+#[cfg(layer_shell)]
 mod layer_shell;
 
 #[cfg(windows)]
