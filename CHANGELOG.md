@@ -3,6 +3,7 @@
 ## 0.2.5
 
 - Glide no longer keeps the machine awake just by running. `omarchy-glide-idle.service` turned Omarchy idle off every 20 seconds and the engine ran under a `systemd-inhibit --what=idle:sleep` block, so a machine with Glide running never locked and never suspended, even when nobody was using it. Remote input arrives through a virtual pointer and keyboard that the compositor already counts as user activity, so a machine controlled from a paired machine still stays awake while it is in use. Installing or updating stops and removes the old unit, which turns Omarchy idle back on, and restarts the engine without the inhibitor.
+- A machine whose keyboard and mouse are driving a paired machine now locks when left alone. While Glide forwards input, its capture surface holds keyboard focus, so Omarchy's screensaver lost focus, exited after a second, and its exit cancelled the lock. The engine now releases the capture once no input has been forwarded for five seconds less than the first enabled Omarchy idle timeout (`idle.screensaver`, else `idle.lock`, from `~/.config/omarchy/shell.json` or the packaged defaults), reread at every handoff. Stay Awake keeps the handoff, and with both timeouts at 0 nothing is released.
 
 ## 0.2.4
 

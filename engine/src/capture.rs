@@ -14,7 +14,7 @@ use local_channel::mpsc::{Receiver, Sender, channel};
 use tokio::task::{JoinHandle, spawn_local};
 use tokio_util::sync::CancellationToken;
 
-use crate::connect::LanMouseConnection;
+use crate::{connect::LanMouseConnection, idle_release};
 
 pub(crate) struct Capture {
     cancellation_token: CancellationToken,
@@ -89,6 +89,8 @@ impl Capture {
             conn,
             enter_fraction: None,
             event_tx,
+            idle_release_after: None,
+            last_forwarded: Instant::now(),
             request_rx,
             release_bind: Rc::new(RefCell::new(release_bind)),
             state: Default::default(),
@@ -183,6 +185,11 @@ struct CaptureTask {
     /// same crossing point as the initial one
     enter_fraction: Option<f64>,
     event_tx: Sender<ICaptureEvent>,
+    /// release the outgoing capture after this long without forwarded
+    /// input, read from the Omarchy idle config when a handoff begins
+    idle_release_after: Option<Duration>,
+    /// when this host last forwarded physical input to the active client
+    last_forwarded: Instant,
     release_bind: Rc<RefCell<Vec<scancode::Linux>>>,
     request_rx: Receiver<CaptureRequest>,
     state: State,
@@ -325,10 +332,30 @@ impl CaptureTask {
                         self.release_bind.borrow_mut().clone_from(&bind);
                     }
                 },
+                _ = idle_deadline(self.active_client, self.idle_release_after, self.last_forwarded) => {
+                    self.release_for_idle(capture).await?;
+                }
                 _ = self.cancellation_token.cancelled() => break,
             }
         }
         Ok(())
+    }
+
+    /// The sender's own compositor is about to start its idle screensaver.
+    /// Hand keyboard focus back to the desktop so that screensaver can run
+    /// and the lock that follows it is not cancelled.
+    async fn release_for_idle(&mut self, capture: &mut InputCapture) -> Result<(), CaptureError> {
+        if idle_release::stay_awake() {
+            // Omarchy will not idle; keep the handoff and check again later.
+            self.last_forwarded = Instant::now();
+            return Ok(());
+        }
+        log::info!(
+            "releasing capture: no input for {:?}, ahead of the Omarchy screensaver",
+            self.idle_release_after.unwrap_or_default()
+        );
+        // non-geometric release: idle has no edge context
+        self.release_capture(capture, None).await
     }
 
     async fn handle_capture_event(
@@ -375,9 +402,14 @@ impl CaptureTask {
             return Ok(());
         }
 
+        self.last_forwarded = Instant::now();
+
         // activated a new client
         if let CaptureEvent::Begin(fraction) = event {
             if Some(handle) != self.active_client {
+                // Read per handoff so edits to the Omarchy idle timeouts apply
+                // without restarting Glide.
+                self.idle_release_after = idle_release::release_after();
                 self.state = State::WaitingForAck;
                 self.enter_fraction = fraction;
                 self.active_client.replace(handle);
@@ -485,6 +517,15 @@ impl CaptureTask {
                 .expect("channel closed");
         }
         Ok(())
+    }
+}
+
+/// Resolves once an outgoing handoff has gone `after` without forwarded
+/// input; never resolves while nothing is being sent or the release is off.
+async fn idle_deadline(active: Option<CaptureHandle>, after: Option<Duration>, last: Instant) {
+    match (active, after) {
+        (Some(_), Some(after)) => tokio::time::sleep_until((last + after).into()).await,
+        _ => std::future::pending().await,
     }
 }
 
@@ -624,6 +665,8 @@ mod stale_capture_tests {
             conn,
             enter_fraction: None,
             event_tx,
+            idle_release_after: None,
+            last_forwarded: Instant::now(),
             request_rx,
             release_bind: Rc::new(RefCell::new(vec![scancode::Linux::KeyLeftCtrl])),
             state: Default::default(),
@@ -727,6 +770,63 @@ mod stale_capture_tests {
                         .iter()
                         .any(|e| matches!(e, ICaptureEvent::RemoteControlInactive)),
                     "destroying an inactive handle must not release the active capture"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_deadline_only_runs_during_an_outgoing_handoff() {
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        let after = Some(Duration::from_secs(1));
+        assert!(
+            idle_deadline(None, after, long_ago)
+                .now_or_never()
+                .is_none()
+        );
+        assert!(
+            idle_deadline(Some(DEFAULT_HANDLE), None, long_ago)
+                .now_or_never()
+                .is_none()
+        );
+        assert!(
+            idle_deadline(Some(DEFAULT_HANDLE), after, Instant::now())
+                .now_or_never()
+                .is_none()
+        );
+        // tokio's sleep_until needs a timer tick even for a past deadline
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            idle_deadline(Some(DEFAULT_HANDLE), after, long_ago),
+        )
+        .await
+        .expect("an expired idle deadline resolves");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_release_ends_the_outgoing_handoff() {
+        LocalSet::new()
+            .run_until(async {
+                let (mut task, mut event_rx) = test_task();
+                let mut capture = dummy_capture().await;
+                let _ = setup_with_queued_stale_begin(&mut task, &mut capture).await;
+                let _ = drain_events(&mut event_rx);
+
+                task.release_for_idle(&mut capture)
+                    .await
+                    .expect("idle release");
+
+                if idle_release::stay_awake() {
+                    // a developer machine with Stay Awake on keeps the handoff
+                    assert_eq!(task.active_client, Some(DEFAULT_HANDLE));
+                    return;
+                }
+                assert_eq!(task.active_client, None);
+                assert!(
+                    drain_events(&mut event_rx)
+                        .iter()
+                        .any(|e| matches!(e, ICaptureEvent::RemoteControlInactive)),
+                    "idle release must end remote control"
                 );
             })
             .await;
