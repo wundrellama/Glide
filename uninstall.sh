@@ -2,7 +2,9 @@
 set -euo pipefail
 base=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 omarchy plugin disable wundrellama.glide
-systemctl --user disable --now omarchy-glide.service omarchy-glide-discovery.service omarchy-glide-idle.service
+systemctl --user disable --now omarchy-glide.service omarchy-glide-discovery.service
+# Older installs also carry the retired idle unit.
+systemctl --user disable --now omarchy-glide-idle.service >/dev/null 2>&1 || true
 python3 - <<'PY'
 import json, subprocess
 from pathlib import Path

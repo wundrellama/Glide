@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.5
+
+- Glide no longer keeps the machine awake just by running. `omarchy-glide-idle.service` turned Omarchy idle off every 20 seconds and the engine ran under a `systemd-inhibit --what=idle:sleep` block, so a machine with Glide running never locked and never suspended, even when nobody was using it. Remote input arrives through a virtual pointer and keyboard that the compositor already counts as user activity, so a machine controlled from a paired machine still stays awake while it is in use. Installing or updating stops and removes the old unit, which turns Omarchy idle back on, and restarts the engine without the inhibitor.
+
 ## 0.2.4
 
 - The engine no longer aborts when a monitor appears and disappears within one compositor turn, as a Hyprland config reload can do in clamshell mode. Lan Mouse looked up every `xdg_output` event with `.expect("output")` and never destroyed the `xdg_output` object of a removed monitor; it now destroys that object with the monitor and ignores events for monitors it has already dropped.

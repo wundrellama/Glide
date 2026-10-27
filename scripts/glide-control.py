@@ -11,7 +11,6 @@ import sys
 import tomllib
 
 UNIT = 'omarchy-glide.service'
-IDLE_UNIT = 'omarchy-glide-idle.service'
 PLUGIN_SCRIPT = '.config/omarchy/plugins/wundrellama.glide/scripts/glide-control.py'
 
 
@@ -150,7 +149,7 @@ def main():
         return
     if args.action == 'settings':
         reconcile_clipboard()
-        subprocess.run(['systemctl', '--user', 'start', UNIT, IDLE_UNIT], check=True, timeout=10)
+        subprocess.run(['systemctl', '--user', 'start', UNIT], check=True, timeout=10)
         subprocess.Popen(['/usr/bin/lan-mouse'], start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return
@@ -160,10 +159,10 @@ def main():
         action = 'pause' if active else 'resume'
     # Stopping releases captured input and pauses both sending and receiving.
     if action == 'pause':
-        subprocess.run(['systemctl', '--user', 'stop', IDLE_UNIT, UNIT], check=True, timeout=10)
+        subprocess.run(['systemctl', '--user', 'stop', UNIT], check=True, timeout=10)
     else:
         reconcile_clipboard()
-        subprocess.run(['systemctl', '--user', 'start', UNIT, IDLE_UNIT], check=True, timeout=10)
+        subprocess.run(['systemctl', '--user', 'start', UNIT], check=True, timeout=10)
     if not args.local_only:
         ok, error = remote_action(action)
         if not ok:

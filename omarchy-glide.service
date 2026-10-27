@@ -3,12 +3,13 @@ Description=Omarchy Glide mouse and keyboard sharing
 Documentation=https://github.com/feschber/lan-mouse
 PartOf=graphical-session.target
 After=graphical-session.target
-Wants=omarchy-glide-idle.service
 
 [Service]
 Type=simple
 ExecStartPre=/usr/bin/python3 %h/.config/omarchy/plugins/wundrellama.glide/scripts/glide_clipboard.py reconcile
-ExecStart=/usr/bin/systemd-inhibit --what=idle:sleep --mode=block --who=Glide '--why=Remote mouse control' %h/.local/bin/omarchy-glide-engine daemon
+# No idle or sleep inhibitor: emulated remote input already counts as user
+# activity on the receiver, and an unused machine must still lock and suspend.
+ExecStart=%h/.local/bin/omarchy-glide-engine daemon
 Restart=on-failure
 RestartSec=3
 # Off the home LAN the bind address is missing and the engine exits at once

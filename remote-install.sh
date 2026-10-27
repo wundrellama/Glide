@@ -30,7 +30,14 @@ PY
 systemctl --user daemon-reload
 systemctl --user disable --now omarchy-glide-owner.service >/dev/null 2>&1 || true
 rm -f "$HOME/.config/systemd/user/omarchy-glide-owner.service"
-systemctl --user enable --now omarchy-glide.service omarchy-glide-discovery.service omarchy-glide-idle.service
+# Retired: it re-disabled Omarchy idle every 20s, so the screen never locked.
+# Stopping it runs its ExecStopPost, which turns Omarchy idle back on.
+systemctl --user disable --now omarchy-glide-idle.service >/dev/null 2>&1 || true
+rm -f "$HOME/.config/systemd/user/omarchy-glide-idle.service"
+systemctl --user daemon-reload
+systemctl --user enable omarchy-glide.service omarchy-glide-discovery.service
+# Restart, not just start, so a running engine drops its old idle:sleep inhibitor.
+systemctl --user restart omarchy-glide.service omarchy-glide-discovery.service
 python3 - <<'PY'
 import json
 from pathlib import Path

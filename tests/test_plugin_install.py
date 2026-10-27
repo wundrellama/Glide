@@ -67,6 +67,24 @@ class PluginInstallTests(unittest.TestCase):
         self.assertIn(reconcile, unit)
         self.assertLess(unit.index(reconcile), unit.index('ExecStart='))
 
+    def test_glide_does_not_hold_idle_or_sleep(self):
+        # Emulated remote input already resets compositor idle; an unused
+        # machine running Glide must still lock and suspend.
+        self.assertFalse((ROOT / 'omarchy-glide-idle.service').exists())
+        unit = (ROOT / 'omarchy-glide.service').read_text()
+        self.assertNotIn('systemd-inhibit', unit)
+        self.assertNotIn('omarchy-glide-idle', unit)
+        for name in ('scripts/glide-control.py', 'scripts/glide_network.py'):
+            with self.subTest(name=name):
+                self.assertNotIn('omarchy-glide-idle', (ROOT / name).read_text())
+        for name in ('install.sh', 'remote-install.sh'):
+            with self.subTest(name=name):
+                text = (ROOT / name).read_text()
+                retire = 'systemctl --user disable --now omarchy-glide-idle.service'
+                self.assertIn(retire, text)
+                self.assertNotIn('enable --now omarchy-glide.service omarchy-glide-discovery.service omarchy-glide-idle', text)
+                self.assertLess(text.index(retire), text.index('systemctl --user restart omarchy-glide.service'))
+
     def test_active_install_paths_use_new_identity(self):
         for name in ('install.sh', 'remote-install.sh', 'uninstall.sh',
                      'scripts/install-plugin.sh', 'omarchy-glide-discovery.service', 'Layout.qml'):

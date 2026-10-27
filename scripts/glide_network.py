@@ -278,7 +278,6 @@ def install_remote(peer):
                 (PLUGIN/'scripts', 'scripts'),
                 (PLUGIN/'omarchy-glide.service', 'omarchy-glide.service'),
                 (PLUGIN/'omarchy-glide-discovery.service', 'omarchy-glide-discovery.service'),
-                (PLUGIN/'omarchy-glide-idle.service', 'omarchy-glide-idle.service'),
                 (PLUGIN/'remote-install.sh', 'remote-install.sh'),
             ]
             for source, name in files:
