@@ -191,7 +191,12 @@ Panel {
     iconComponent: Component {
       Image {
         source: Qt.resolvedUrl("assets/glide-icon.png")
-        anchors.fill: parent
+        // The bar loads icon components into an unsized Loader and measures
+        // their painted bounds, so the image needs its own size.
+        width: Style.bar.iconCanvas
+        height: Style.bar.iconCanvas
+        sourceSize.width: Style.bar.iconCanvas * 2
+        sourceSize.height: Style.bar.iconCanvas * 2
         fillMode: Image.PreserveAspectFit
         smooth: true
       }
